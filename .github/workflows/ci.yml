@@ -35,6 +35,8 @@ jobs:
           cargo test -p linux-common --test linux_video_test test_image_decode_png_and_ppm_and_swh264_roundtrip
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run Linux binary soak smoke test
+        run: cargo run -p platform-linux-arm64 -- --soak --frames 15 --width 320 --height 180 --fps 30 127.0.0.1:0
 
   macos-and-ios:
     name: macOS & iOS Build, Test, Clippy, Swift Typecheck
@@ -52,14 +54,24 @@ jobs:
         run: cargo test --workspace
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Cross-build ffi-capi for iOS device & simulator
+      - name: Run macOS binary smoke test
+        run: cargo run -p platform-macos -- --frames 10 127.0.0.1:0
+      - name: Build IkakimFFI.xcframework and link iOS Simulator binary
         run: |
-          cargo build -p ffi-capi --target aarch64-apple-ios
-          cargo build -p ffi-capi --target aarch64-apple-ios-sim
-      - name: Typecheck iOS Swift host against Xcode iOS SDKs
-        run: |
-          xcrun --sdk iphoneos swiftc -typecheck -target arm64-apple-ios16.0 -I platforms/ios platforms/ios/*.swift
-          xcrun --sdk iphonesimulator swiftc -typecheck -target arm64-apple-ios16.0-simulator -I platforms/ios platforms/ios/*.swift
+          ./scripts/build-ios-xcframework.sh --debug
+          xcrun --sdk iphonesimulator swiftc -target arm64-apple-ios16.0-simulator \
+            -I build/ios/IkakimFFI.xcframework/ios-arm64-simulator/Headers \
+            -L build/ios/IkakimFFI.xcframework/ios-arm64-simulator -lffi_capi \
+            -framework AVFoundation -framework CoreMedia -framework CoreVideo \
+            -framework Metal -framework VideoToolbox -framework AudioToolbox \
+            -framework CoreAudio -framework ImageIO -framework WebKit \
+            -framework CoreFoundation -framework QuartzCore -framework Security \
+            -parse-as-library platforms/ios/*.swift -o /tmp/IkakimIosSimTest
+          rm -f /tmp/IkakimIosSimTest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ikakim-ios-xcframework
+          path: build/ios/IkakimFFI.xcframework
 
   android:
     name: Android NDK (arm64-v8a) & Kotlin APK Build
@@ -82,3 +94,9 @@ jobs:
       - name: Assemble Android debug APK
         working-directory: platforms/android
         run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ikakim-android-debug-apk
+          path: |
+            platforms/android/app/build/outputs/apk/debug/*.apk
+            platforms/android/app/src/main/jniLibs/arm64-v8a/libffi_capi.so

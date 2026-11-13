@@ -1,0 +1,80 @@
+name: ikakim Release Artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release-linux:
+    name: Release Linux Binaries (x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libfdk-aac-dev libegl-dev libgl-dev \
+            libgbm-dev libdrm-dev libvulkan1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: cargo build --release -p platform-linux-vm -p platform-linux-arm64 -p ffi-capi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ikakim-linux-x86_64-release
+          path: |
+            target/release/platform-linux-vm
+            target/release/platform-linux-arm64
+            target/release/libffi_capi.so
+            crates/ffi-capi/include/ikakim_ffi.h
+
+  release-apple:
+    name: Release macOS Binary & iOS XCFramework
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+      - name: Build macOS release host & iOS Release XCFramework
+        run: |
+          cargo build --release -p platform-macos
+          ./scripts/build-ios-xcframework.sh --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ikakim-apple-release
+          path: |
+            target/release/platform-macos
+            build/ios/IkakimFFI.xcframework
+
+  release-android:
+    name: Release Android NDK JNI & APK
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release libffi_capi.so (arm64-v8a)
+        run: ./scripts/build-android-jni.sh --release
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - name: Assemble Android APK
+        working-directory: platforms/android
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ikakim-android-arm64-release
+          path: |
+            platforms/android/app/src/main/jniLibs/arm64-v8a/libffi_capi.so
+            platforms/android/app/build/outputs/apk/debug/*.apk
