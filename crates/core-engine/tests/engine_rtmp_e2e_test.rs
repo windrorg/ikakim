@@ -1,8 +1,12 @@
 use core_audio::mixer::{AudioInputConfig, AudioMixer};
 use core_audio::MIX_BLOCK_FRAMES;
 use core_engine::pipeline::{flush_encoders_to_outputs, EngineControlBridge, PipelineTickContext};
-use core_engine::SwH264Encoder;
-use core_gpu::{CompositorConfig, GpuCompositor, GpuContext};
+use core_engine::virtual_input::{
+    channel_rms_dbfs, goertzel_magnitude, VirtualAudioSignal, VirtualAudioSource,
+    VirtualVideoPattern, VirtualVideoSource,
+};
+use core_engine::{SwH264Decoder, SwH264Encoder};
+use core_gpu::{ColorSpace, CompositorConfig, GpuCompositor, GpuContext};
 use core_net_ui::rpc::ControlBackend;
 use core_net_ui::{EmbeddedServer, ServerConfig};
 use core_rtmp::abr::AbrConfig;
@@ -14,9 +18,9 @@ use core_rtmp::chunk::{
 use core_rtmp::handshake::perform_server_handshake;
 use core_rtmp::TlsRootConfig;
 use core_types::clock::{MasterClock, PtsUs};
-use core_types::media::{CodecKind, EncodedPacket};
+use core_types::media::{CodecKind, EncodedPacket, LayerTransform, NativeBufferHandle, VideoFrame};
 use core_types::state::PipelineState;
-use core_types::traits::{AudioEncoder, VideoEncoder};
+use core_types::traits::{AudioEncoder, VideoDecoder, VideoEncoder};
 use core_types::CoreResult;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -1081,4 +1085,503 @@ fn test_engine_websocket_jsonrpc_stream_lifecycle_and_controls() {
     server.stop();
     stop_srv.store(true, Ordering::Relaxed);
     srv_thread.join().unwrap();
+}
+
+struct CaptureAudioEncoder {
+    inner: MockAudioEncoder,
+    captured_pcm: Arc<Mutex<Vec<f32>>>,
+}
+
+impl CaptureAudioEncoder {
+    fn new() -> (Self, Arc<Mutex<Vec<f32>>>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                inner: MockAudioEncoder::new(),
+                captured_pcm: Arc::clone(&captured),
+            },
+            captured,
+        )
+    }
+}
+
+impl AudioEncoder for CaptureAudioEncoder {
+    fn push_pcm_f32(&mut self, interleaved_pcm: &[f32], pts: PtsUs) -> CoreResult<()> {
+        self.captured_pcm
+            .lock()
+            .unwrap()
+            .extend_from_slice(interleaved_pcm);
+        self.inner.push_pcm_f32(interleaved_pcm, pts)
+    }
+
+    fn pull_packet(&mut self) -> CoreResult<Option<EncodedPacket>> {
+        self.inner.pull_packet()
+    }
+}
+
+fn avcc_payload_to_annexb(avcc: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= avcc.len() {
+        let nalu_len = u32::from_be_bytes([avcc[off], avcc[off + 1], avcc[off + 2], avcc[off + 3]])
+            as usize;
+        off += 4;
+        if off + nalu_len > avcc.len() {
+            break;
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&avcc[off..off + nalu_len]);
+        off += nalu_len;
+    }
+    out
+}
+
+fn avc_config_record_to_annexb(rec: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if rec.len() < 7 {
+        return out;
+    }
+    let num_sps = (rec[5] & 0x1F) as usize;
+    let mut off = 6usize;
+    for _ in 0..num_sps {
+        if off + 2 > rec.len() {
+            return out;
+        }
+        let len = u16::from_be_bytes([rec[off], rec[off + 1]]) as usize;
+        off += 2;
+        if off + len > rec.len() {
+            return out;
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&rec[off..off + len]);
+        off += len;
+    }
+    if off >= rec.len() {
+        return out;
+    }
+    let num_pps = rec[off] as usize;
+    off += 1;
+    for _ in 0..num_pps {
+        if off + 2 > rec.len() {
+            return out;
+        }
+        let len = u16::from_be_bytes([rec[off], rec[off + 1]]) as usize;
+        off += 2;
+        if off + len > rec.len() {
+            return out;
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&rec[off..off + len]);
+        off += len;
+    }
+    out
+}
+
+fn decode_flv_avc_tags_to_frames(video_tags: &[Vec<u8>]) -> Vec<VideoFrame> {
+    let mut dec = SwH264Decoder::new();
+    let mut frames = Vec::new();
+    for (idx, tag) in video_tags.iter().enumerate() {
+        if tag.len() < 5 {
+            continue;
+        }
+        let pts = PtsUs((idx as u64) * 33_333);
+        let pkt = if tag[1] == 0x00 {
+            let annexb = avc_config_record_to_annexb(&tag[5..]);
+            if annexb.is_empty() {
+                continue;
+            }
+            EncodedPacket {
+                codec: CodecKind::H264,
+                pts,
+                dts: pts,
+                is_keyframe: true,
+                is_sequence_header: true,
+                data: annexb,
+            }
+        } else if tag[1] == 0x01 {
+            let annexb = avcc_payload_to_annexb(&tag[5..]);
+            if annexb.is_empty() {
+                continue;
+            }
+            EncodedPacket {
+                codec: CodecKind::H264,
+                pts,
+                dts: pts,
+                is_keyframe: (tag[0] & 0xF0) == 0x10,
+                is_sequence_header: false,
+                data: annexb,
+            }
+        } else {
+            continue;
+        };
+        dec.push_packet(&pkt).unwrap();
+        while let Some(frame) = dec.pull_frame().unwrap() {
+            frames.push(frame);
+        }
+    }
+    frames
+}
+
+fn nv12_pixel_rgb(frame: &VideoFrame, x: u32, y: u32) -> [u8; 3] {
+    let NativeBufferHandle::CpuFallback { data, stride } = &frame.handle else {
+        panic!("expected CpuFallback NV12 buffer");
+    };
+    let s = (*stride as usize).max(frame.width as usize);
+    let y_size = s * (frame.height as usize);
+    let xi = (x as usize).min((frame.width as usize).saturating_sub(1));
+    let yi = (y as usize).min((frame.height as usize).saturating_sub(1));
+    let y_val = data[yi * s + xi] as f32;
+    let uv_row = y_size + (yi / 2) * s;
+    let uv_col = (xi / 2) * 2;
+    let cb = data[uv_row + uv_col] as f32;
+    let cr = data[uv_row + uv_col + 1] as f32;
+
+    let yn = (y_val - 16.0) * (255.0 / 219.0);
+    let cbn = (cb - 128.0) * (255.0 / 224.0);
+    let crn = (cr - 128.0) * (255.0 / 224.0);
+
+    let r = (yn + 1.5748 * crn).clamp(0.0, 255.0) as u8;
+    let g = (yn - 0.187324 * cbn - 0.468124 * crn).clamp(0.0, 255.0) as u8;
+    let b = (yn + 1.8556 * cbn).clamp(0.0, 255.0) as u8;
+    [r, g, b]
+}
+
+#[test]
+fn test_engine_virtual_av_pipeline_compositor_and_mixer_verification() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let rec_clone = Arc::clone(&records);
+    let stop_srv = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop_srv);
+    listener.set_nonblocking(true).unwrap();
+
+    let srv_thread = thread::spawn(move || {
+        while !stop_clone.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((s, _)) => handle_rtmp_session(s, Arc::clone(&rec_clone), ServerBehavior::Normal),
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    });
+
+    let width = 64u32;
+    let height = 64u32;
+    let mut clock = MasterClock::new();
+    let mut mixer = AudioMixer::new(clock.clone());
+    let (ch0, mut prod0) = mixer.add_channel(AudioInputConfig {
+        name: "StereoTone".into(),
+        sample_rate: 48_000,
+        channels: 2,
+        initial_gain: 1.0,
+        initial_muted: false,
+        initial_delay_ms: 0,
+    });
+    let (ch1, mut prod1) = mixer.add_channel(AudioInputConfig {
+        name: "SubTone".into(),
+        sample_rate: 48_000,
+        channels: 2,
+        initial_gain: 1.0,
+        initial_muted: false,
+        initial_delay_ms: 0,
+    });
+    let bridge = EngineControlBridge::new(
+        vec![ch0, ch1],
+        mixer.master_handle(),
+        1_200_000,
+        30.0,
+        TlsRootConfig::System,
+    );
+    let mut server = EmbeddedServer::start(
+        ServerConfig {
+            bind_addr: "127.0.0.1:0".into(),
+            meter_interval_ms: 25,
+            preview_width: width,
+            preview_height: height,
+            preview_fps: 30,
+        },
+        bridge.clone(),
+    )
+    .expect("EmbeddedServer");
+    let gpu = GpuContext::new_headless().expect("GpuContext");
+    let mut comp = GpuCompositor::new(
+        gpu,
+        CompositorConfig {
+            main_width: width,
+            main_height: height,
+            preview_width: width,
+            preview_height: height,
+            target_fps: 30,
+        },
+    );
+    let mut main_enc = SwH264Encoder::new(width, height, 1_200_000);
+    let mut prev_enc = SwH264Encoder::new(width, height, 400_000);
+    let (mut aud_enc, captured_pcm) = CaptureAudioEncoder::new();
+
+    let video_base = VirtualVideoSource::new(width, height, VirtualVideoPattern::default())
+        .with_bar_speed(8);
+    let video_overlay =
+        VirtualVideoSource::new(width, height, VirtualVideoPattern::Solid([235, 30, 210, 255]));
+    let overlay_rgba = video_overlay.render_rgba(0);
+
+    let mut aud_src0 = VirtualAudioSource::new(
+        48_000,
+        VirtualAudioSignal::DualChannelTone {
+            left_freq_hz: 440.0,
+            right_freq_hz: 880.0,
+            amplitude: 0.40,
+        },
+    );
+    let mut aud_src1 = VirtualAudioSource::new(
+        48_000,
+        VirtualAudioSignal::SineTone {
+            freq_hz: 1200.0,
+            amplitude: 0.35,
+        },
+    );
+
+    // Phase A: Base 4-quadrant NV12 + hidden overlay + ch0 dual-tone active (ch1 muted)
+    bridge.set_audio_mute(1, true).unwrap();
+    bridge
+        .set_overlay_transform(
+            1,
+            LayerTransform {
+                x: 0.5,
+                y: 0.5,
+                scale_x: 0.45,
+                scale_y: 0.45,
+                visible: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    bridge
+        .start_stream(
+            &format!("rtmp://127.0.0.1:{}/live/virtual_av", port),
+            Some(1_200_000),
+        )
+        .unwrap();
+
+    let mut pump_av_frames = |start_idx: u64, count: u64| {
+        for i in start_idx..(start_idx + count) {
+            let pts = PtsUs(i * 33_333);
+            let (y_plane, uv_plane) = video_base.render_nv12_bt709(i);
+            let base_layer = comp
+                .create_nv12_layer(
+                    0,
+                    true,
+                    false,
+                    ColorSpace::Bt709Limited,
+                    width,
+                    height,
+                    &y_plane,
+                    &uv_plane,
+                    bridge.layer_transform(0),
+                )
+                .unwrap();
+            let overlay_layer = comp
+                .create_rgba_layer(
+                    1,
+                    false,
+                    false,
+                    width,
+                    height,
+                    &overlay_rgba,
+                    bridge.layer_transform(1),
+                )
+                .unwrap();
+            comp.render_dual(&[&base_layer, &overlay_layer], pts).unwrap();
+
+            let composited_rgba =
+                comp.readback_texture_rgba(comp.main_texture(), width, height).unwrap();
+            main_enc.encode_rgba(&composited_rgba, pts).unwrap();
+            prev_enc.encode_rgba(&composited_rgba, pts).unwrap();
+
+            let blocks = VirtualAudioSource::mix_blocks_for_30fps_frame(i);
+            for _ in 0..blocks {
+                let pcm0 = aud_src0.next_stereo_f32(MIX_BLOCK_FRAMES);
+                let pcm1 = aud_src1.next_stereo_f32(MIX_BLOCK_FRAMES);
+                prod0.push_f32(&pcm0);
+                prod1.push_f32(&pcm1);
+                let mut mix_buf = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
+                let st = mixer.mix_block(&mut mix_buf);
+                aud_enc.push_pcm_f32(&mix_buf, st.to_pts_us()).unwrap();
+            }
+
+            let mut tick = PipelineTickContext {
+                clock: &mut clock,
+                bridge: &bridge,
+                compositor: &mut comp,
+                main_encoder: &mut main_enc,
+                preview_encoder: &mut prev_enc,
+                audio_encoder: &mut aud_enc,
+                server: &server,
+            };
+            flush_encoders_to_outputs(&mut tick, pts).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    pump_av_frames(0, 6);
+    let pcm_phase_a_end = captured_pcm.lock().unwrap().len();
+
+    // Phase B: Reveal magenta overlay on Top-Right quadrant, attenuate ch0 (-12dB), unmute ch1 (1200Hz)
+    bridge
+        .set_overlay_transform(
+            1,
+            LayerTransform {
+                x: 0.5,
+                y: 0.5,
+                scale_x: 0.45,
+                scale_y: 0.45,
+                visible: true,
+                z_order: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    bridge.set_audio_gain(0, -12.0).unwrap();
+    bridge.set_audio_mute(1, false).unwrap();
+    pump_av_frames(6, 6);
+    let pcm_phase_b_end = captured_pcm.lock().unwrap().len();
+
+    // Phase C: Mute both audio channels & hide overlay again
+    bridge.set_audio_mute(0, true).unwrap();
+    bridge.set_audio_mute(1, true).unwrap();
+    bridge
+        .set_overlay_transform(
+            1,
+            LayerTransform {
+                x: 0.5,
+                y: 0.5,
+                scale_x: 0.45,
+                scale_y: 0.45,
+                visible: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    pump_av_frames(12, 4);
+
+    bridge.stop_stream().unwrap();
+    bridge.stop_all();
+    server.stop();
+    stop_srv.store(true, Ordering::Relaxed);
+    srv_thread.join().unwrap();
+
+    // 1. Decode post-RTMP delivered video frames back via SwH264Decoder and verify colors, overlay, and motion
+    let recs = records.lock().unwrap();
+    assert_eq!(recs.len(), 1);
+    let frames = decode_flv_avc_tags_to_frames(&recs[0].video_tags);
+    assert!(
+        frames.len() >= 15,
+        "expected >= 15 decoded RTMP frames, got {}",
+        frames.len()
+    );
+
+    // Phase A frame 0: Red TL, Green TR, Blue BL, Yellow BR
+    let f0 = &frames[0];
+    let tl0 = nv12_pixel_rgb(f0, 12, 12);
+    let tr0 = nv12_pixel_rgb(f0, 48, 12);
+    let bl0 = nv12_pixel_rgb(f0, 12, 50);
+    let br0 = nv12_pixel_rgb(f0, 48, 50);
+    assert!(tl0[0] > 170 && tl0[1] < 80 && tl0[2] < 80, "TL expected Red, got {:?}", tl0);
+    assert!(tr0[1] > 170 && tr0[0] < 80 && tr0[2] < 80, "TR expected Green, got {:?}", tr0);
+    assert!(bl0[2] > 170 && bl0[0] < 80 && bl0[1] < 95, "BL expected Blue, got {:?}", bl0);
+    assert!(br0[0] > 170 && br0[1] > 160 && br0[2] < 80, "BR expected Yellow, got {:?}", br0);
+
+    // Moving bar verification between frame 0 (bar_x = 0..16) and frame 4 (bar_x = 32..48)
+    // `y = height / 2 - 2` lies inside the moving bar vertically while strictly remaining in the Red/Green top half.
+    let bar_y = height / 2 - 2;
+    let bar0_left = nv12_pixel_rgb(&frames[0], 8, bar_y);
+    let bar0_mid = nv12_pixel_rgb(&frames[0], 40, bar_y);
+    let bar4_left = nv12_pixel_rgb(&frames[4], 8, bar_y);
+    let bar4_mid = nv12_pixel_rgb(&frames[4], 40, bar_y);
+    assert!(
+        bar0_left[0] > 190 && bar0_left[1] > 190 && bar0_left[2] > 190,
+        "frame 0 bar at x=8 should be bright white, got {:?}",
+        bar0_left
+    );
+    assert!(
+        bar0_mid[1] > 160 && bar0_mid[0] < 80,
+        "frame 0 at x=40 should still be Green bg, got {:?}",
+        bar0_mid
+    );
+    assert!(
+        bar4_left[0] > 170 && bar4_left[1] < 80,
+        "frame 4 at x=8 should return to Red bg, got {:?}",
+        bar4_left
+    );
+    assert!(
+        bar4_mid[0] > 190 && bar4_mid[1] > 190 && bar4_mid[2] > 190,
+        "frame 4 bar at x=40 should be bright white, got {:?}",
+        bar4_mid
+    );
+
+    // Phase B frame 7: Top-Right quadrant (48, 16) is now Magenta [235, 30, 210] while TL remains Red
+    let f7 = &frames[7];
+    let tr7 = nv12_pixel_rgb(f7, 48, 16);
+    let tl7 = nv12_pixel_rgb(f7, 12, 12);
+    assert!(
+        tr7[0] > 175 && tr7[1] < 85 && tr7[2] > 155,
+        "Phase B TR expected Magenta overlay, got {:?}",
+        tr7
+    );
+    assert!(tl7[0] > 170 && tl7[1] < 80, "Phase B TL should remain Red, got {:?}", tl7);
+
+    // Phase C frame 13: Top-Right returns to Green once overlay hidden
+    let tr13 = nv12_pixel_rgb(&frames[13], 48, 16);
+    assert!(
+        tr13[1] > 170 && tr13[0] < 80 && tr13[2] < 80,
+        "Phase C TR should revert to Green after visible=false, got {:?}",
+        tr13
+    );
+
+    // 2. Verify post-mixer audio frequencies, stereo L/R isolation, -12dB gain, 2-ch mix, and mute
+    let all_pcm = captured_pcm.lock().unwrap();
+    let pcm_a = &all_pcm[..pcm_phase_a_end];
+    let pcm_b = &all_pcm[pcm_phase_a_end..pcm_phase_b_end];
+    let pcm_c = &all_pcm[pcm_phase_b_end..];
+
+    let l_440_a = goertzel_magnitude(pcm_a, 2, 0, 48_000.0, 440.0);
+    let l_880_a = goertzel_magnitude(pcm_a, 2, 0, 48_000.0, 880.0);
+    let r_880_a = goertzel_magnitude(pcm_a, 2, 1, 48_000.0, 880.0);
+    let r_440_a = goertzel_magnitude(pcm_a, 2, 1, 48_000.0, 440.0);
+    let l_1200_a = goertzel_magnitude(pcm_a, 2, 0, 48_000.0, 1200.0);
+    assert!(
+        l_440_a > 0.25 && l_440_a > l_880_a * 4.0,
+        "Phase A Left should dominate at 440Hz (440={}, 880={})",
+        l_440_a,
+        l_880_a
+    );
+    assert!(
+        r_880_a > 0.25 && r_880_a > r_440_a * 4.0,
+        "Phase A Right should dominate at 880Hz (880={}, 440={})",
+        r_880_a,
+        r_440_a
+    );
+    assert!(l_1200_a < 0.03, "Phase A ch1 (1200Hz) should be muted, got {}", l_1200_a);
+
+    let l_440_b = goertzel_magnitude(pcm_b, 2, 0, 48_000.0, 440.0);
+    let l_1200_b = goertzel_magnitude(pcm_b, 2, 0, 48_000.0, 1200.0);
+    assert!(
+        l_440_b < l_440_a * 0.45 && l_440_b > 0.05,
+        "Phase B ch0 440Hz should be attenuated by ~-12dB (A={}, B={})",
+        l_440_a,
+        l_440_b
+    );
+    assert!(
+        l_1200_b > 0.20,
+        "Phase B unmuted ch1 1200Hz should mix in clearly, got {}",
+        l_1200_b
+    );
+
+    let rms_c_l = channel_rms_dbfs(pcm_c, 2, 0);
+    let rms_c_r = channel_rms_dbfs(pcm_c, 2, 1);
+    assert!(
+        rms_c_l < -60.0 && rms_c_r < -60.0,
+        "Phase C muted channels should be silent (L={} dBFS, R={} dBFS)",
+        rms_c_l,
+        rms_c_r
+    );
 }

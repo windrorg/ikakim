@@ -31,14 +31,13 @@ fn macos_main(args: &[String]) {
     use core_audio::mixer::{AudioInputConfig, AudioMixer};
     use core_audio::MIX_BLOCK_FRAMES;
     use core_engine::pipeline::{flush_encoders_to_outputs, EngineControlBridge, PipelineTickContext};
+    use core_engine::{VirtualAudioSignal, VirtualAudioSource, VirtualVideoPattern, VirtualVideoSource};
     use core_gpu::{CompositorConfig, GpuCompositor, GpuContext};
     use core_net_ui::rpc::ControlBackend;
     use core_net_ui::{EmbeddedServer, ServerConfig};
     use core_rtmp::TlsRootConfig;
     use core_types::clock::{MasterClock, PtsUs};
-    use core_types::media::LayerTransform;
     use core_types::traits::AudioEncoder;
-    use std::f32::consts::PI;
     use std::time::{Duration, Instant};
 
     let probe_only = args.iter().any(|a| a == "--probe");
@@ -128,9 +127,14 @@ fn macos_main(args: &[String]) {
     let mut prev_enc = VtH264Encoder::new(640, 360, 30, 600_000).expect("VT prev enc");
     let mut aud_enc = AudioToolboxAacEncoder::new(128_000).expect("AAC enc");
     let mut mix_buf = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
-    let mut y = vec![48u8; 1280 * 720];
-    let mut uv = vec![128u8; 1280 * 720 / 2];
-    let mut audio_pcm = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
+    let v_src = VirtualVideoSource::new(1280, 720, VirtualVideoPattern::ColorbarsMotion);
+    let mut a_src = VirtualAudioSource::new(
+        core_types::clock::MASTER_SAMPLE_RATE as u32,
+        VirtualAudioSignal::SineTone {
+            freq_hz: 440.0,
+            amplitude: 0.15,
+        },
+    );
 
     let mut i: u64 = 0;
     let frame_dur = Duration::from_nanos(33_333_333);
@@ -143,20 +147,10 @@ fn macos_main(args: &[String]) {
         let tick_start = Instant::now();
         let pts = PtsUs(i * 33_333);
 
-        // Animated colorbar sweep so live preview and RTMP encode real motion
-        let bar_x = (i as usize * 16) % 1160;
-        y.fill(40);
-        for row in 120..600 {
-            let off = row * 1280;
-            y[off + bar_x..off + bar_x + 120].fill(220);
-        }
-        for pair in uv.chunks_exact_mut(2) {
-            pair[0] = ((96 + (i * 3) % 80) & 0xFF) as u8;
-            pair[1] = 160;
-        }
+        let (y, uv) = v_src.render_nv12_bt709(i);
         let pb = CVPixelBufferWrapper::new_nv12(1280, 720, &y, &uv).expect("NV12 PB");
         let mut layer = importer
-            .import_to_gpu_layer(&comp, &pb, 0, true, LayerTransform::default())
+            .import_to_gpu_layer(&comp, &pb, 0, true, bridge.layer_transform(0))
             .expect("import layer");
 
         let mut refs = [&mut layer.layer];
@@ -175,20 +169,15 @@ fn macos_main(args: &[String]) {
             .encode_rgba(640, 360, &prev_rgba, pts)
             .expect("encode prev");
 
-        // Feed continuous 48kHz tone when streaming or interactive
-        let base_sample = i as usize * MIX_BLOCK_FRAMES;
-        for n in 0..MIX_BLOCK_FRAMES {
-            let phase = (base_sample + n) as f32 / core_types::clock::MASTER_SAMPLE_RATE as f32;
-            let s = 0.08 * (2.0 * PI * 440.0 * phase).sin();
-            audio_pcm[n * 2] = s;
-            audio_pcm[n * 2 + 1] = s;
+        let blocks = VirtualAudioSource::mix_blocks_for_30fps_frame(i);
+        for _ in 0..blocks {
+            let pcm = a_src.next_stereo_f32(MIX_BLOCK_FRAMES);
+            prod0.push_f32(&pcm);
+            let st = mixer.mix_block(&mut mix_buf);
+            aud_enc
+                .push_pcm_f32(&mix_buf, st.to_pts_us())
+                .expect("encode audio");
         }
-        prod0.push_f32(&audio_pcm);
-
-        let st = mixer.mix_block(&mut mix_buf);
-        aud_enc
-            .push_pcm_f32(&mix_buf, st.to_pts_us())
-            .expect("encode audio");
 
         let mut tick = PipelineTickContext {
             clock: &mut clock,

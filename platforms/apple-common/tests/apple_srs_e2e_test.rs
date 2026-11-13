@@ -6,6 +6,10 @@ use apple_common::video_toolbox::VtH264Encoder;
 use core_audio::mixer::{AudioInputConfig, AudioInputProducer, AudioMixer};
 use core_audio::MIX_BLOCK_FRAMES;
 use core_engine::pipeline::{flush_encoders_to_outputs, EngineControlBridge, PipelineTickContext};
+use core_engine::virtual_input::{
+    channel_rms_dbfs, goertzel_magnitude, VirtualAudioSignal, VirtualAudioSource,
+    VirtualVideoPattern, VirtualVideoSource,
+};
 use core_gpu::{CompositorConfig, GpuCompositor, GpuContext};
 use core_net_ui::rpc::ControlBackend;
 use core_net_ui::{EmbeddedServer, ServerConfig};
@@ -14,7 +18,7 @@ use core_rtmp::TlsRootConfig;
 use core_types::clock::{MasterClock, PtsUs};
 use core_types::media::LayerTransform;
 use core_types::state::PipelineState;
-use core_types::traits::AudioEncoder;
+use core_types::traits::{AudioEncoder, VideoEncoder};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -53,6 +57,26 @@ fn resolve_tool(env_var: &str, candidates: &[&str], which_name: &str) -> Option<
         }
     }
     None
+}
+
+fn require_or_skip_srs_ffprobe_ffmpeg() -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let (srs, ffprobe) = require_or_skip_srs_and_ffprobe()?;
+    let require = env::var("IKAKIM_REQUIRE_SRS").as_deref() == Ok("1");
+    let ffmpeg = resolve_tool(
+        "IKAKIM_FFMPEG_BIN",
+        &["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"],
+        "ffmpeg",
+    );
+    match ffmpeg {
+        Some(ff) => Some((srs, ffprobe, ff)),
+        None => {
+            if require {
+                panic!("IKAKIM_REQUIRE_SRS=1 is set, but missing ffmpeg binary. Install ffmpeg.");
+            }
+            eprintln!("[SKIP] ffmpeg binary not found for decoded A/V verification");
+            None
+        }
+    }
 }
 
 fn require_or_skip_srs_and_ffprobe() -> Option<(PathBuf, PathBuf)> {
@@ -453,6 +477,7 @@ struct AppleSrsHarness {
     clock: MasterClock,
     mixer: AudioMixer,
     prod0: AudioInputProducer,
+    prod1: Option<AudioInputProducer>,
     bridge: Arc<EngineControlBridge>,
     server: EmbeddedServer,
     importer: AppleMetalZeroCopyImporter,
@@ -460,10 +485,57 @@ struct AppleSrsHarness {
     main_enc: VtH264Encoder,
     prev_enc: VtH264Encoder,
     aud_enc: AudioToolboxAacEncoder,
+    base_video: Option<VirtualVideoSource>,
+    overlay_bgra: Option<(u32, u32, Vec<u8>)>,
+    aud_src0: VirtualAudioSource,
+    aud_src1: Option<VirtualAudioSource>,
 }
 
 impl AppleSrsHarness {
     fn new(width: u32, height: u32, initial_bitrate_bps: u32) -> Self {
+        Self::new_with_virtual(
+            width,
+            height,
+            initial_bitrate_bps,
+            None,
+            None,
+            VirtualAudioSignal::SineTone {
+                freq_hz: 440.0,
+                amplitude: 0.2,
+            },
+            None,
+        )
+    }
+
+    fn new_virtual(
+        width: u32,
+        height: u32,
+        initial_bitrate_bps: u32,
+        base_video: VirtualVideoSource,
+        overlay_video: Option<VirtualVideoSource>,
+        aud_signal0: VirtualAudioSignal,
+        aud_signal1: Option<VirtualAudioSignal>,
+    ) -> Self {
+        Self::new_with_virtual(
+            width,
+            height,
+            initial_bitrate_bps,
+            Some(base_video),
+            overlay_video,
+            aud_signal0,
+            aud_signal1,
+        )
+    }
+
+    fn new_with_virtual(
+        width: u32,
+        height: u32,
+        initial_bitrate_bps: u32,
+        base_video: Option<VirtualVideoSource>,
+        overlay_video: Option<VirtualVideoSource>,
+        aud_signal0: VirtualAudioSignal,
+        aud_signal1: Option<VirtualAudioSignal>,
+    ) -> Self {
         let prev_width = width / 2;
         let prev_height = height / 2;
         let clock = MasterClock::new();
@@ -476,8 +548,25 @@ impl AppleSrsHarness {
             initial_muted: false,
             initial_delay_ms: 0,
         });
+        let mut channels = vec![ch0];
+        let mut prod1 = None;
+        let mut aud_src1 = None;
+        if let Some(sig1) = aud_signal1 {
+            let (ch1, p1) = mixer.add_channel(AudioInputConfig {
+                name: "apple-aux".into(),
+                sample_rate: 48_000,
+                channels: 2,
+                initial_gain: 1.0,
+                initial_muted: false,
+                initial_delay_ms: 0,
+            });
+            channels.push(ch1);
+            prod1 = Some(p1);
+            aud_src1 = Some(VirtualAudioSource::new(48_000, sig1));
+        }
+
         let bridge = EngineControlBridge::new(
-            vec![ch0],
+            channels,
             mixer.master_handle(),
             initial_bitrate_bps,
             30.0,
@@ -514,6 +603,13 @@ impl AppleSrsHarness {
             .expect("VtH264Encoder preview");
         let aud_enc = AudioToolboxAacEncoder::new(128_000).expect("AudioToolboxAacEncoder");
 
+        let overlay_bgra = overlay_video.map(|src| {
+            let w = src.width;
+            let h = src.height;
+            let bytes = src.render_bgra(0);
+            (w, h, bytes)
+        });
+
         Self {
             width,
             height,
@@ -522,6 +618,7 @@ impl AppleSrsHarness {
             clock,
             mixer,
             prod0,
+            prod1,
             bridge,
             server,
             importer,
@@ -529,16 +626,21 @@ impl AppleSrsHarness {
             main_enc,
             prev_enc,
             aud_enc,
+            base_video,
+            overlay_bgra,
+            aud_src0: VirtualAudioSource::new(48_000, aud_signal0),
+            aud_src1,
         }
     }
 
     fn step(&mut self, frame_idx: u64, high_entropy: bool) {
         let w = self.width as usize;
         let h = self.height as usize;
-        let mut y_plane = vec![0u8; w * h];
-        let mut uv_plane = vec![128u8; w * (h / 2)];
-        let shift = (frame_idx as usize * 11) % w;
-        if high_entropy {
+        let (y_plane, uv_plane) = if let Some(src) = &self.base_video {
+            src.render_nv12_bt709(frame_idx)
+        } else if high_entropy {
+            let mut y_plane = vec![0u8; w * h];
+            let mut uv_plane = vec![128u8; w * (h / 2)];
             // Deterministic pseudo-random textured pattern so VideoToolbox generates larger P/I slices under ABR test
             for row in 0..h {
                 for col in 0..w {
@@ -554,48 +656,43 @@ impl AppleSrsHarness {
                     }
                 }
             }
+            (y_plane, uv_plane)
         } else {
-            for row in 0..h {
-                for col in 0..w {
-                    let band = ((col + shift) * 6 / w) % 6;
-                    let y = match band {
-                        0 => 220,
-                        1 => 180,
-                        2 => 140,
-                        3 => 100,
-                        4 => 60,
-                        _ => 24,
-                    };
-                    y_plane[row * w + col] = y;
-                }
-            }
-            for row in 0..(h / 2) {
-                for pair in 0..(w / 2) {
-                    let band = ((pair * 2 + shift) * 6 / w) % 6;
-                    let (u, v) = match band {
-                        0 => (128, 128),
-                        1 => (44, 160),
-                        2 => (168, 72),
-                        3 => (90, 60),
-                        4 => (210, 190),
-                        _ => (128, 128),
-                    };
-                    uv_plane[row * w + pair * 2] = u;
-                    uv_plane[row * w + pair * 2 + 1] = v;
-                }
-            }
-        }
+            VirtualVideoSource::new(self.width, self.height, VirtualVideoPattern::ColorbarsMotion)
+                .render_nv12_bt709(frame_idx)
+        };
 
         let pb = CVPixelBufferWrapper::new_nv12(self.width, self.height, &y_plane, &uv_plane)
             .expect("CVPixelBufferWrapper::new_nv12");
-        let imported = self
+        let imported_base = self
             .importer
-            .import_to_gpu_layer(&self.comp, &pb, 0, true, LayerTransform::default())
-            .expect("import_to_gpu_layer");
+            .import_to_gpu_layer(&self.comp, &pb, 0, true, self.bridge.layer_transform(0))
+            .expect("import_to_gpu_layer base");
+
+        let imported_overlay = self.overlay_bgra.as_ref().map(|(ow, oh, bgra)| {
+            let ov_pb =
+                CVPixelBufferWrapper::new_bgra(*ow, *oh, bgra).expect("CVPixelBufferWrapper bgra");
+            self.importer
+                .import_to_gpu_layer(
+                    &self.comp,
+                    &ov_pb,
+                    1,
+                    false,
+                    self.bridge.layer_transform(1),
+                )
+                .expect("import_to_gpu_layer overlay")
+        });
 
         let pts = PtsUs(frame_idx * 33_333);
-        let layers = [&imported.layer];
-        self.comp.render_dual(&layers, pts).expect("render_dual");
+        if let Some(ov) = &imported_overlay {
+            self.comp
+                .render_dual(&[&imported_base.layer, &ov.layer], pts)
+                .expect("render_dual");
+        } else {
+            self.comp
+                .render_dual(&[&imported_base.layer], pts)
+                .expect("render_dual");
+        }
         self.importer.flush();
 
         let main_rgba = self
@@ -615,22 +712,14 @@ impl AppleSrsHarness {
             .expect("vt encode prev");
 
         // Feed exact 48kHz audio alongside 30fps video: MIX_BLOCK_FRAMES=480 (10ms), so 4,3,3 blocks = 100ms per 3 frames
-        let blocks = if frame_idx % 3 == 0 { 4 } else { 3 };
-        let base_blocks = (frame_idx / 3) * 10 + match frame_idx % 3 {
-            0 => 0,
-            1 => 4,
-            _ => 7,
-        };
-        for b in 0..blocks {
-            let mut pcm = Vec::with_capacity(MIX_BLOCK_FRAMES * 2);
-            let sample_base = (base_blocks + b as u64) * MIX_BLOCK_FRAMES as u64;
-            for i in 0..MIX_BLOCK_FRAMES {
-                let t = (sample_base + i as u64) as f32 / 48_000.0;
-                let s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.2;
-                pcm.push(s);
-                pcm.push(s);
+        let blocks = VirtualAudioSource::mix_blocks_for_30fps_frame(frame_idx);
+        for _ in 0..blocks {
+            let pcm0 = self.aud_src0.next_stereo_f32(MIX_BLOCK_FRAMES);
+            self.prod0.push_f32(&pcm0);
+            if let (Some(p1), Some(s1)) = (self.prod1.as_mut(), self.aud_src1.as_mut()) {
+                let pcm1 = s1.next_stereo_f32(MIX_BLOCK_FRAMES);
+                p1.push_f32(&pcm1);
             }
-            self.prod0.push_f32(&pcm);
             let mut mix_buf = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
             let st = self.mixer.mix_block(&mut mix_buf);
             self.aud_enc
@@ -1180,4 +1269,438 @@ fn test_srs_e2e_duplicate_stream_key_conflict_and_takeover() {
     );
 
     secondary.shutdown();
+}
+
+struct DecodedFlvSegment {
+    video_rgb_frames: Vec<Vec<u8>>,
+    audio_pcm_stereo: Vec<f32>,
+}
+
+fn capture_and_decode_flv_segment(
+    ffmpeg_bin: &std::path::Path,
+    flv_url: &str,
+    harness: &mut AppleSrsHarness,
+    frame_idx: &mut u64,
+    pre_roll_frames: usize,
+    duration_secs: f32,
+) -> DecodedFlvSegment {
+    for _ in 0..pre_roll_frames {
+        harness.step(*frame_idx, false);
+        *frame_idx += 1;
+        thread::sleep(Duration::from_millis(33));
+    }
+
+    let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_dir = env::temp_dir().join(format!("ikakim_ffdec_{}_{}", std::process::id(), seq));
+    fs::create_dir_all(&tmp_dir).unwrap();
+    let vid_path = tmp_dir.join("video.rgb24");
+    let aud_path = tmp_dir.join("audio.f32le");
+
+    let ff_bin = ffmpeg_bin.to_path_buf();
+    let url = flv_url.to_string();
+    let vid_c = vid_path.clone();
+    let aud_c = aud_path.clone();
+    let dur_str = format!("{:.2}", duration_secs);
+    let done = Arc::new(AtomicBool::new(false));
+    let done_c = Arc::clone(&done);
+
+    let handle = thread::spawn(move || {
+        let out = Command::new(ff_bin)
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-analyzeduration",
+                "800000",
+                "-probesize",
+                "65536",
+                "-i",
+                &url,
+                "-t",
+                &dur_str,
+                "-map",
+                "0:v:0",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                vid_c.to_str().unwrap(),
+                "-map",
+                "0:a:0",
+                "-f",
+                "f32le",
+                "-acodec",
+                "pcm_f32le",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                aud_c.to_str().unwrap(),
+            ])
+            .output()
+            .expect("spawn ffmpeg decode");
+        done_c.store(true, Ordering::Release);
+        out
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !done.load(Ordering::Acquire) && Instant::now() < deadline {
+        harness.step(*frame_idx, false);
+        *frame_idx += 1;
+        thread::sleep(Duration::from_millis(33));
+    }
+
+    let out = handle.join().expect("join ffmpeg decode thread");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "ffmpeg decode failed on {} (status={}): stderr=\n{}",
+        flv_url,
+        out.status,
+        stderr
+    );
+
+    let raw_vid = fs::read(&vid_path).unwrap_or_default();
+    let raw_aud = fs::read(&aud_path).unwrap_or_default();
+    let _ = fs::remove_dir_all(&tmp_dir);
+
+    let frame_bytes = (harness.width as usize) * (harness.height as usize) * 3;
+    let video_rgb_frames: Vec<Vec<u8>> = raw_vid
+        .chunks_exact(frame_bytes)
+        .map(|c| c.to_vec())
+        .collect();
+    let audio_pcm_stereo: Vec<f32> = raw_aud
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    DecodedFlvSegment {
+        video_rgb_frames,
+        audio_pcm_stereo,
+    }
+}
+
+fn rgb_pixel(frame_rgb: &[u8], width: u32, x: u32, y: u32) -> [u8; 3] {
+    let idx = ((y as usize) * (width as usize) + (x as usize)) * 3;
+    [frame_rgb[idx], frame_rgb[idx + 1], frame_rgb[idx + 2]]
+}
+
+fn find_bright_bar_center_x(frame_rgb: &[u8], width: u32, height: u32) -> Option<f32> {
+    let y = height / 2 - 4;
+    let mut sum_x = 0.0f32;
+    let mut count = 0u32;
+    for x in 0..width {
+        let [r, g, b] = rgb_pixel(frame_rgb, width, x, y);
+        if r > 185 && g > 185 && b > 185 {
+            sum_x += x as f32;
+            count += 1;
+        }
+    }
+    if count >= 4 {
+        Some(sum_x / count as f32)
+    } else {
+        None
+    }
+}
+
+fn send_ws_rpc_sequence(ui_addr: std::net::SocketAddr, rpcs: &[&str]) {
+    let mut ws = TcpStream::connect(ui_addr).expect("connect WS RPC");
+    ws.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let req = format!(
+        "GET /ws HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        ui_addr
+    );
+    ws.write_all(req.as_bytes()).unwrap();
+    let mut hdr = [0u8; 1024];
+    let n = ws.read(&mut hdr).unwrap();
+    assert!(String::from_utf8_lossy(&hdr[..n]).contains("101 Switching Protocols"));
+
+    for txt in rpcs {
+        let payload = txt.as_bytes();
+        let mask = [0x21, 0x43, 0x65, 0x87];
+        let mut frame = vec![0x81u8];
+        if payload.len() < 126 {
+            frame.push(0x80 | payload.len() as u8);
+        } else {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i % 4]);
+        }
+        ws.write_all(&frame).unwrap();
+    }
+    let _ = ws.flush();
+    thread::sleep(Duration::from_millis(50));
+}
+
+#[test]
+fn test_srs_e2e_delivered_video_color_motion_and_audio_stereo_tones() {
+    let Some((srs_bin, _ffprobe_bin, ffmpeg_bin)) = require_or_skip_srs_ffprobe_ffmpeg() else {
+        return;
+    };
+    let srs = SrsProcess::start(srs_bin);
+    let width = 320u32;
+    let height = 180u32;
+    let base_video =
+        VirtualVideoSource::new(width, height, VirtualVideoPattern::default()).with_bar_speed(10);
+    let mut harness = AppleSrsHarness::new_virtual(
+        width,
+        height,
+        1_200_000,
+        base_video,
+        None,
+        VirtualAudioSignal::DualChannelTone {
+            left_freq_hz: 440.0,
+            right_freq_hz: 880.0,
+            amplitude: 0.35,
+        },
+        None,
+    );
+    harness
+        .bridge
+        .start_stream(&srs.rtmp_url("live", "av_verify"), Some(1_200_000))
+        .unwrap();
+
+    let (mut frame_idx, started) = harness.pump_until(0, Duration::from_secs(6), false, |b| {
+        b.snapshot().state == PipelineState::Streaming
+    });
+    assert!(started, "failed to reach Streaming state against SRS");
+
+    let seg = capture_and_decode_flv_segment(
+        &ffmpeg_bin,
+        &srs.flv_url("live", "av_verify"),
+        &mut harness,
+        &mut frame_idx,
+        24,
+        1.5,
+    );
+    harness.shutdown();
+
+    assert!(
+        seg.video_rgb_frames.len() >= 18,
+        "expected >= 18 decoded video frames from SRS, got {}",
+        seg.video_rgb_frames.len()
+    );
+    assert!(
+        seg.audio_pcm_stereo.len() >= 48_000 * 2,
+        "expected >= 1.0s stereo decoded PCM from SRS, got {} samples",
+        seg.audio_pcm_stereo.len()
+    );
+
+    // Inspect a steady-state decoded frame: Red TL, Green TR, Blue BL, Yellow BR
+    let f_mid = &seg.video_rgb_frames[seg.video_rgb_frames.len() / 2];
+    let tl = rgb_pixel(f_mid, width, width / 4, height / 4);
+    let tr = rgb_pixel(f_mid, width, width * 3 / 4, height / 4);
+    let bl = rgb_pixel(f_mid, width, width / 4, height * 3 / 4);
+    let br = rgb_pixel(f_mid, width, width * 3 / 4, height * 3 / 4);
+    assert!(tl[0] > 165 && tl[1] < 85 && tl[2] < 85, "TL expected Red, got {:?}", tl);
+    assert!(tr[1] > 165 && tr[0] < 85 && tr[2] < 85, "TR expected Green, got {:?}", tr);
+    assert!(bl[2] > 165 && bl[0] < 85 && bl[1] < 100, "BL expected Blue, got {:?}", bl);
+    assert!(br[0] > 165 && br[1] > 155 && br[2] < 85, "BR expected Yellow, got {:?}", br);
+
+    // Motion verification: find distinct bright moving-bar X centers ~8 frames apart
+    let f_a = &seg.video_rgb_frames[2];
+    let f_b = &seg.video_rgb_frames[10];
+    let cx_a = find_bright_bar_center_x(f_a, width, height)
+        .expect("moving bar not found in early SRS frame");
+    let cx_b = find_bright_bar_center_x(f_b, width, height)
+        .expect("moving bar not found in later SRS frame");
+    assert!(
+        (cx_b - cx_a).abs() > 25.0,
+        "expected visible horizontal bar motion across SRS decoded frames (cx_a={}, cx_b={})",
+        cx_a,
+        cx_b
+    );
+
+    // Stereo audio frequency verification after AAC encode -> SRS -> ffmpeg decode (use second half to avoid AAC priming padding)
+    let aud_steady = &seg.audio_pcm_stereo[seg.audio_pcm_stereo.len() / 2..];
+    let l_440 = goertzel_magnitude(aud_steady, 2, 0, 48_000.0, 440.0);
+    let l_880 = goertzel_magnitude(aud_steady, 2, 0, 48_000.0, 880.0);
+    let r_880 = goertzel_magnitude(aud_steady, 2, 1, 48_000.0, 880.0);
+    let r_440 = goertzel_magnitude(aud_steady, 2, 1, 48_000.0, 440.0);
+    assert!(
+        l_440 > 0.15 && l_440 > l_880 * 3.5,
+        "Left delivered AAC audio should contain 440Hz (440={}, 880={})",
+        l_440,
+        l_880
+    );
+    assert!(
+        r_880 > 0.15 && r_880 > r_440 * 3.5,
+        "Right delivered AAC audio should contain 880Hz (880={}, 440={})",
+        r_880,
+        r_440
+    );
+}
+
+#[test]
+fn test_srs_e2e_delivered_overlay_transform_and_audio_gain_mute_via_ws_rpc() {
+    let Some((srs_bin, _ffprobe_bin, ffmpeg_bin)) = require_or_skip_srs_ffprobe_ffmpeg() else {
+        return;
+    };
+    let srs = SrsProcess::start(srs_bin);
+    let width = 320u32;
+    let height = 180u32;
+    let base_video =
+        VirtualVideoSource::new(width, height, VirtualVideoPattern::default()).with_bar_speed(6);
+    let overlay_video =
+        VirtualVideoSource::new(width, height, VirtualVideoPattern::Solid([235, 30, 210, 255]));
+    let mut harness = AppleSrsHarness::new_virtual(
+        width,
+        height,
+        1_200_000,
+        base_video,
+        Some(overlay_video),
+        VirtualAudioSignal::SineTone {
+            freq_hz: 500.0,
+            amplitude: 0.35,
+        },
+        Some(VirtualAudioSignal::SineTone {
+            freq_hz: 1000.0,
+            amplitude: 0.35,
+        }),
+    );
+
+    // Phase 1: Magenta overlay on Top-Left quadrant; both 500Hz & 1000Hz active
+    harness
+        .bridge
+        .set_overlay_transform(
+            1,
+            LayerTransform {
+                x: -0.5,
+                y: 0.5,
+                scale_x: 0.45,
+                scale_y: 0.45,
+                visible: true,
+                z_order: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    harness
+        .bridge
+        .start_stream(&srs.rtmp_url("live", "av_ws_ctrl"), Some(1_200_000))
+        .unwrap();
+
+    let (mut frame_idx, started) = harness.pump_until(0, Duration::from_secs(6), false, |b| {
+        b.snapshot().state == PipelineState::Streaming
+    });
+    assert!(started, "failed to reach Streaming state against SRS");
+
+    let seg1 = capture_and_decode_flv_segment(
+        &ffmpeg_bin,
+        &srs.flv_url("live", "av_ws_ctrl"),
+        &mut harness,
+        &mut frame_idx,
+        24,
+        1.5,
+    );
+    let f1 = seg1.video_rgb_frames.last().expect("phase 1 video frame");
+    let tl1 = rgb_pixel(f1, width, width / 4, height / 4);
+    let br1 = rgb_pixel(f1, width, width * 3 / 4, height * 3 / 4);
+    assert!(
+        tl1[0] > 165 && tl1[1] < 90 && tl1[2] > 145,
+        "Phase 1 TL expected Magenta overlay, got {:?}",
+        tl1
+    );
+    assert!(
+        br1[0] > 165 && br1[1] > 155 && br1[2] < 85,
+        "Phase 1 BR expected Yellow base, got {:?}",
+        br1
+    );
+    let a1 = &seg1.audio_pcm_stereo[seg1.audio_pcm_stereo.len() / 2..];
+    let mag_500_p1 = goertzel_magnitude(a1, 2, 0, 48_000.0, 500.0);
+    let mag_1000_p1 = goertzel_magnitude(a1, 2, 0, 48_000.0, 1000.0);
+    assert!(
+        mag_500_p1 > 0.12 && mag_1000_p1 > 0.12,
+        "Phase 1 expected both 500Hz ({}) and 1000Hz ({})",
+        mag_500_p1,
+        mag_1000_p1
+    );
+
+    // Phase 2 via WebSocket JSON-RPC: move overlay to Bottom-Right, attenuate Ch0 -12dB, mute Ch1
+    send_ws_rpc_sequence(
+        harness.server.local_addr(),
+        &[
+            r#"{"jsonrpc":"2.0","id":10,"method":"overlay.set_transform","params":{"layer_id":1,"x":0.5,"y":-0.5,"scale_x":0.45,"scale_y":0.45,"opacity":1.0,"rotation_rad":0.0,"visible":true}}"#,
+            r#"{"jsonrpc":"2.0","id":11,"method":"audio.set_gain","params":{"channel":0,"gain_db":-12.0}}"#,
+            r#"{"jsonrpc":"2.0","id":12,"method":"audio.set_mute","params":{"channel":1,"muted":true}}"#,
+        ],
+    );
+    // Force an IDR keyframe so SRS gop_cache rolls over cleanly onto post-RPC frames
+    VideoEncoder::request_keyframe(&mut harness.main_enc);
+
+    let seg2 = capture_and_decode_flv_segment(
+        &ffmpeg_bin,
+        &srs.flv_url("live", "av_ws_ctrl"),
+        &mut harness,
+        &mut frame_idx,
+        35,
+        1.5,
+    );
+    let f2 = seg2.video_rgb_frames.last().expect("phase 2 video frame");
+    let tl2 = rgb_pixel(f2, width, width / 4, height / 4);
+    let br2 = rgb_pixel(f2, width, width * 3 / 4, height * 3 / 4);
+    assert!(
+        tl2[0] > 165 && tl2[1] < 85 && tl2[2] < 85,
+        "Phase 2 TL expected Red after overlay moved away, got {:?}",
+        tl2
+    );
+    assert!(
+        br2[0] > 165 && br2[1] < 90 && br2[2] > 145,
+        "Phase 2 BR expected Magenta after WS overlay move, got {:?}",
+        br2
+    );
+    let a2 = &seg2.audio_pcm_stereo[seg2.audio_pcm_stereo.len() / 2..];
+    let mag_500_p2 = goertzel_magnitude(a2, 2, 0, 48_000.0, 500.0);
+    let mag_1000_p2 = goertzel_magnitude(a2, 2, 0, 48_000.0, 1000.0);
+    assert!(
+        mag_500_p2 < mag_500_p1 * 0.45 && mag_500_p2 > 0.03,
+        "Phase 2 500Hz should be attenuated ~-12dB (p1={}, p2={})",
+        mag_500_p1,
+        mag_500_p2
+    );
+    assert!(
+        mag_1000_p2 < 0.02,
+        "Phase 2 1000Hz (Ch1 muted via WS) should vanish, got {}",
+        mag_1000_p2
+    );
+
+    // Phase 3 via WebSocket JSON-RPC: hide overlay & mute Ch0 (full audio silence)
+    send_ws_rpc_sequence(
+        harness.server.local_addr(),
+        &[
+            r#"{"jsonrpc":"2.0","id":13,"method":"overlay.set_transform","params":{"layer_id":1,"x":0.5,"y":-0.5,"scale_x":0.45,"scale_y":0.45,"opacity":1.0,"rotation_rad":0.0,"visible":false}}"#,
+            r#"{"jsonrpc":"2.0","id":14,"method":"audio.set_mute","params":{"channel":0,"muted":true}}"#,
+        ],
+    );
+    VideoEncoder::request_keyframe(&mut harness.main_enc);
+
+    let seg3 = capture_and_decode_flv_segment(
+        &ffmpeg_bin,
+        &srs.flv_url("live", "av_ws_ctrl"),
+        &mut harness,
+        &mut frame_idx,
+        35,
+        1.5,
+    );
+    let f3 = seg3.video_rgb_frames.last().expect("phase 3 video frame");
+    let br3 = rgb_pixel(f3, width, width * 3 / 4, height * 3 / 4);
+    assert!(
+        br3[0] > 165 && br3[1] > 155 && br3[2] < 85,
+        "Phase 3 BR expected Yellow after visible=false via WS, got {:?}",
+        br3
+    );
+    let a3 = &seg3.audio_pcm_stereo[seg3.audio_pcm_stereo.len() / 2..];
+    let rms_l = channel_rms_dbfs(a3, 2, 0);
+    let rms_r = channel_rms_dbfs(a3, 2, 1);
+    assert!(
+        rms_l < -55.0 && rms_r < -55.0,
+        "Phase 3 muted stream should be silent (L={} dBFS, R={} dBFS)",
+        rms_l,
+        rms_r
+    );
+
+    harness.shutdown();
 }

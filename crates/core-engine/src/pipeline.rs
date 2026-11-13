@@ -160,6 +160,16 @@ impl EngineControlBridge {
         }
     }
 
+    /// 指定レイヤーの現在の `LayerTransform` を取得する（毎フレームレイヤーを再生成する経路向け）
+    pub fn layer_transform(&self, layer_id: usize) -> LayerTransform {
+        let g = self.inner.lock().unwrap();
+        g.overlays
+            .iter()
+            .find(|o| o.layer_id == layer_id)
+            .map(|o| o.transform)
+            .unwrap_or_default()
+    }
+
     /// 待機中の `LayerTransform` 変更を GPU レイヤー群へ反映する
     pub fn apply_pending_transforms(&self, compositor: &GpuCompositor, layers: &mut [&mut GpuLayer]) {
         let updates: Vec<(usize, LayerTransform)> = {
