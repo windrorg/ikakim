@@ -26,7 +26,8 @@ use std::sync::Arc;
 use apple_common::audio_toolbox::AudioToolboxAacEncoder;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use apple_common::cv_metal::{
-    AppleMetalZeroCopyImporter, CVPixelBufferWrapper, ImportedGpuLayer,
+    AppleMetalZeroCopyImporter, AppleZeroCopyRenderSurfacePool, CVPixelBufferWrapper,
+    ImportedGpuLayer,
 };
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use apple_common::video_toolbox::VtH264Encoder;
@@ -280,6 +281,10 @@ pub struct IkakimEngineHandle {
     compositor: GpuCompositor,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     apple_importer: Option<AppleMetalZeroCopyImporter>,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    apple_main_pool: Option<AppleZeroCopyRenderSurfacePool>,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    apple_preview_pool: Option<AppleZeroCopyRenderSurfacePool>,
     layers: BTreeMap<usize, StoredLayer>,
     ahb_descriptors: BTreeMap<usize, AhbDescriptor>,
     main_encoder: PlatformVideoEncoder,
@@ -348,6 +353,14 @@ impl IkakimEngineHandle {
         let gpu_ctx = GpuContext::new_headless()?;
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let apple_importer = AppleMetalZeroCopyImporter::new(&gpu_ctx.device).ok();
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let apple_main_pool = apple_importer.as_ref().and_then(|imp| {
+            AppleZeroCopyRenderSurfacePool::new(imp, &gpu_ctx.device, main_w, main_h, 6).ok()
+        });
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let apple_preview_pool = apple_importer.as_ref().and_then(|imp| {
+            AppleZeroCopyRenderSurfacePool::new(imp, &gpu_ctx.device, prev_w, prev_h, 6).ok()
+        });
 
         let compositor = GpuCompositor::new(
             gpu_ctx,
@@ -367,6 +380,12 @@ impl IkakimEngineHandle {
             initial_bitrate_bps: initial_bitrate,
             ..AbrConfig::default()
         });
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let apple_zero_copy_active = apple_main_pool.is_some()
+            && apple_preview_pool.is_some()
+            && matches!(main_encoder, PlatformVideoEncoder::VideoToolbox(_));
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let apple_zero_copy_active = false;
 
         Ok(Self {
             clock,
@@ -377,6 +396,10 @@ impl IkakimEngineHandle {
             compositor,
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             apple_importer,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            apple_main_pool,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            apple_preview_pool,
             layers: BTreeMap::new(),
             ahb_descriptors: BTreeMap::new(),
             main_encoder,
@@ -389,7 +412,7 @@ impl IkakimEngineHandle {
             encoded_video_packets: 0,
             encoded_audio_packets: 0,
             streaming_active: false,
-            apple_zero_copy_active: false,
+            apple_zero_copy_active,
             android_ahb_active: false,
             last_error: None,
         })
@@ -445,13 +468,7 @@ impl IkakimEngineHandle {
                 .apply_pending_transforms(&self.compositor, &mut mut_refs);
         }
 
-        // Render main & preview GPU targets
-        {
-            let ro_refs: Vec<&GpuLayer> = self.layers.values().map(StoredLayer::as_layer).collect();
-            let _stats = self.compositor.render_dual(&ro_refs, pts)?;
-        }
-
-        // Evaluate AIMD ABR
+        // Evaluate AIMD ABR first so we know whether non-IDR encode should be skipped
         let abr_decision = self.abr.evaluate(queued_rtmp_bytes, elapsed_ms);
         if let Some(new_bps) = abr_decision.new_bitrate_bps {
             self.bridge
@@ -461,32 +478,75 @@ impl IkakimEngineHandle {
             self.main_encoder.as_dyn_mut().request_keyframe();
         }
 
-        // Readback & encode composited frames
-        let (mw, mh) = self.compositor.main_size();
-        if !abr_decision.drop_non_idr {
-            let main_rgba = self
+        // Render & encode main + preview targets (Apple Metal->IOSurface->VT zero-copy when active)
+        let mut rendered_via_apple_zero_copy = false;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let (
+            Some(imp),
+            Some(main_pool),
+            Some(prev_pool),
+            PlatformVideoEncoder::VideoToolbox(main_vt),
+            PlatformVideoEncoder::VideoToolbox(prev_vt),
+        ) = (
+            self.apple_importer.as_ref(),
+            self.apple_main_pool.as_mut(),
+            self.apple_preview_pool.as_mut(),
+            &mut self.main_encoder,
+            &mut self.preview_encoder,
+        ) {
+            let main_slot = main_pool.acquire_slot(imp, &self.compositor.context().device)?;
+            let prev_slot = prev_pool.acquire_slot(imp, &self.compositor.context().device)?;
+            {
+                let ro_refs: Vec<&GpuLayer> =
+                    self.layers.values().map(StoredLayer::as_layer).collect();
+                let _stats = self.compositor.render_dual_into(
+                    &ro_refs,
+                    pts,
+                    Some(main_slot.as_external_target()),
+                    Some(prev_slot.as_external_target()),
+                )?;
+            }
+            if !abr_decision.drop_non_idr {
+                main_vt.encode_pixel_buffer(&main_slot.pixel_buffer, pts)?;
+            }
+            prev_vt.encode_pixel_buffer(&prev_slot.pixel_buffer, pts)?;
+            rendered_via_apple_zero_copy = true;
+            self.apple_zero_copy_active = true;
+        }
+
+        if !rendered_via_apple_zero_copy {
+            {
+                let ro_refs: Vec<&GpuLayer> =
+                    self.layers.values().map(StoredLayer::as_layer).collect();
+                let _stats = self.compositor.render_dual(&ro_refs, pts)?;
+            }
+
+            let (mw, mh) = self.compositor.main_size();
+            if !abr_decision.drop_non_idr {
+                let main_rgba = self
+                    .compositor
+                    .readback_texture_rgba(self.compositor.main_texture(), mw, mh)?;
+                self.main_encoder.encode_rgba_frame(
+                    mw,
+                    mh,
+                    &main_rgba,
+                    pts,
+                    &mut self.bgra_scratch,
+                )?;
+            }
+
+            let (pw, ph) = self.compositor.preview_size();
+            let prev_rgba = self
                 .compositor
-                .readback_texture_rgba(self.compositor.main_texture(), mw, mh)?;
-            self.main_encoder.encode_rgba_frame(
-                mw,
-                mh,
-                &main_rgba,
+                .readback_texture_rgba(self.compositor.preview_texture(), pw, ph)?;
+            self.preview_encoder.encode_rgba_frame(
+                pw,
+                ph,
+                &prev_rgba,
                 pts,
                 &mut self.bgra_scratch,
             )?;
         }
-
-        let (pw, ph) = self.compositor.preview_size();
-        let prev_rgba = self
-            .compositor
-            .readback_texture_rgba(self.compositor.preview_texture(), pw, ph)?;
-        self.preview_encoder.encode_rgba_frame(
-            pw,
-            ph,
-            &prev_rgba,
-            pts,
-            &mut self.bgra_scratch,
-        )?;
 
         let mut main_video_pkts = 0u64;
         let mut prev_video_pkts = 0u64;

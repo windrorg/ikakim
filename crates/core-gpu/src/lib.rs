@@ -5,7 +5,7 @@ pub mod compositor;
 pub mod governor;
 
 pub use compositor::{
-    ColorSpace, CompositorConfig, GpuCompositor, GpuContext, GpuLayer, LayerInputKind,
-    OffscreenRenderSink, RenderStats,
+    ColorSpace, CompositorConfig, ExternalRenderFormat, ExternalRenderTarget, GpuCompositor,
+    GpuContext, GpuLayer, LayerInputKind, OffscreenRenderSink, RenderStats,
 };
 pub use governor::{GovernorStats, OverlayGovernor};

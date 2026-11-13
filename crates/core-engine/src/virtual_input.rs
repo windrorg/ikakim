@@ -257,14 +257,33 @@ impl VirtualAudioSource {
         }
     }
 
-    /// 30fps（`33.33ms`）映像フレーム1枚あたりに供給すべき 10ms ミキサーブロック数（4, 3, 3 の周期で厳密に48kHz同期）
+    /// 指定フレームレート（30fps: 4,3,3 / 60fps: 2,2,1）の1フレームあたりに供給すべき
+    /// 10ms ミキサーブロック数（`MIX_BLOCK_FRAMES=480` で厳密に 48kHz 同期）
     #[inline]
-    pub fn mix_blocks_for_30fps_frame(frame_idx: u64) -> usize {
-        if frame_idx % 3 == 0 {
+    pub fn mix_blocks_for_fps_frame(fps: u32, frame_idx: u64) -> usize {
+        if fps >= 60 {
+            if frame_idx % 3 == 2 {
+                1
+            } else {
+                2
+            }
+        } else if frame_idx % 3 == 0 {
             4
         } else {
             3
         }
+    }
+
+    /// 30fps（`33.33ms`）映像フレーム1枚あたりに供給すべき 10ms ミキサーブロック数（4, 3, 3）
+    #[inline]
+    pub fn mix_blocks_for_30fps_frame(frame_idx: u64) -> usize {
+        Self::mix_blocks_for_fps_frame(30, frame_idx)
+    }
+
+    /// 60fps（`16.67ms`）映像フレーム1枚あたりに供給すべき 10ms ミキサーブロック数（2, 2, 1）
+    #[inline]
+    pub fn mix_blocks_for_60fps_frame(frame_idx: u64) -> usize {
+        Self::mix_blocks_for_fps_frame(60, frame_idx)
     }
 
     /// `frames` サンプル分のインターリーブ・ステレオ f32 PCM（要素数 = `frames * 2`）を位相連続で生成

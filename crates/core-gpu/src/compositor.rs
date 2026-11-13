@@ -280,6 +280,29 @@ impl Default for CompositorConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalRenderFormat {
+    Rgba8Unorm,
+    Bgra8Unorm,
+}
+
+impl ExternalRenderFormat {
+    fn to_wgpu(self) -> TextureFormat {
+        match self {
+            Self::Rgba8Unorm => TextureFormat::Rgba8Unorm,
+            Self::Bgra8Unorm => TextureFormat::Bgra8Unorm,
+        }
+    }
+}
+
+/// ゼロコピー外部レンダーターゲット（Metal IOSurface / Vulkan / GBM 等へ直接描画）
+pub struct ExternalRenderTarget<'a> {
+    pub view: &'a TextureView,
+    pub format: ExternalRenderFormat,
+    /// `true` の場合、Pass 2（プレビュー）はこの `view` をテクスチャとして直接縮小ブリットする
+    pub readable_for_preview_blit: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RenderStats {
     pub rendered_layers: usize,
@@ -292,6 +315,7 @@ pub struct GpuCompositor {
     ctx: GpuContext,
     bind_group_layout: BindGroupLayout,
     pipeline: RenderPipeline,
+    bgra_pipeline: RenderPipeline,
     sampler: Sampler,
     dummy_tex: Texture,
     dummy_view: TextureView,
@@ -361,36 +385,20 @@ impl GpuCompositor {
                 push_constant_ranges: &[],
             });
 
-        let pipeline = ctx
-            .device
-            .create_render_pipeline(&RenderPipelineDescriptor {
-                label: Some("ikakim-compositor-pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(ColorTargetState {
-                        format: TextureFormat::Rgba8Unorm,
-                        blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                        write_mask: ColorWrites::ALL,
-                    })],
-                }),
-                primitive: PrimitiveState {
-                    topology: PrimitiveTopology::TriangleStrip,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
+        let pipeline = Self::create_render_pipeline(
+            &ctx.device,
+            &pipeline_layout,
+            &shader,
+            TextureFormat::Rgba8Unorm,
+            "ikakim-compositor-pipeline-rgba",
+        );
+        let bgra_pipeline = Self::create_render_pipeline(
+            &ctx.device,
+            &pipeline_layout,
+            &shader,
+            TextureFormat::Bgra8Unorm,
+            "ikakim-compositor-pipeline-bgra",
+        );
 
         let sampler = ctx.device.create_sampler(&SamplerDescriptor {
             label: Some("ikakim-linear-sampler"),
@@ -458,6 +466,7 @@ impl GpuCompositor {
             ctx,
             bind_group_layout,
             pipeline,
+            bgra_pipeline,
             sampler,
             dummy_tex,
             dummy_view,
@@ -700,11 +709,31 @@ impl GpuCompositor {
         ))
     }
 
-    /// Z 順ソート・負荷ガバナ制限・デュアルレンダーターゲット出力を実行する
+    /// Z 順ソート・負荷ガバナ制限・デュアルレンダーターゲット出力を実行する（内部オフスクリーン用）
     pub fn render_dual(&mut self, layers: &[&GpuLayer], pts: PtsUs) -> CoreResult<RenderStats> {
+        self.render_dual_into(layers, pts, None, None)
+    }
+
+    /// 外部ゼロコピーレンダーターゲットへ直接コンポジット描画する
+    /// （例: Apple `CVPixelBuffer`/`IOSurface` プールや Linux GBM ターゲットへリードバックなしで直結）
+    pub fn render_dual_into(
+        &mut self,
+        layers: &[&GpuLayer],
+        pts: PtsUs,
+        main_target: Option<ExternalRenderTarget<'_>>,
+        preview_target: Option<ExternalRenderTarget<'_>>,
+    ) -> CoreResult<RenderStats> {
         let start = Instant::now();
-        let main_view = self.main_sink.acquire_target()?;
-        let preview_view = self.preview_sink.acquire_target()?;
+        let internal_main_view = if main_target.is_none() {
+            Some(self.main_sink.acquire_target()?)
+        } else {
+            None
+        };
+        let internal_preview_view = if preview_target.is_none() {
+            Some(self.preview_sink.acquire_target()?)
+        } else {
+            None
+        };
 
         let mut visible: Vec<&GpuLayer> = layers
             .iter()
@@ -732,6 +761,26 @@ impl GpuCompositor {
             self.governor.record_throttled(throttled);
         }
 
+        let main_view_ref = main_target
+            .as_ref()
+            .map(|t| t.view)
+            .or(internal_main_view.as_ref())
+            .expect("main render target view");
+        let main_pipeline = match main_target.as_ref().map(|t| t.format.to_wgpu()) {
+            Some(TextureFormat::Bgra8Unorm) => &self.bgra_pipeline,
+            _ => &self.pipeline,
+        };
+
+        let preview_view_ref = preview_target
+            .as_ref()
+            .map(|t| t.view)
+            .or(internal_preview_view.as_ref())
+            .expect("preview render target view");
+        let preview_pipeline = match preview_target.as_ref().map(|t| t.format.to_wgpu()) {
+            Some(TextureFormat::Bgra8Unorm) => &self.bgra_pipeline,
+            _ => &self.pipeline,
+        };
+
         let mut encoder = self
             .ctx
             .device
@@ -744,7 +793,7 @@ impl GpuCompositor {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("ikakim-main-pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &main_view,
+                    view: main_view_ref,
                     resolve_target: None,
                     ops: Operations {
                         load: LoadOp::Clear(Color::BLACK),
@@ -755,7 +804,7 @@ impl GpuCompositor {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(main_pipeline);
             for layer in &selected {
                 pass.set_bind_group(0, &layer.bind_group, &[]);
                 pass.draw(0..4, 0..1);
@@ -763,19 +812,59 @@ impl GpuCompositor {
         }
 
         // Pass 2: プレビュー用（低解像度）スケール出力パス
-        Self::encode_blit_pass(
-            &mut encoder,
-            &self.pipeline,
-            &self.preview_blit_bg,
-            &preview_view,
-        );
+        let external_blit_bg = match main_target.as_ref() {
+            Some(ext) if ext.readable_for_preview_blit => Some(Self::make_bind_group(
+                &self.ctx.device,
+                &self.bind_group_layout,
+                &self.preview_blit_uniform,
+                ext.view,
+                &self.dummy_view,
+                &self.sampler,
+            )),
+            _ => None,
+        };
+        if let Some(ref bg) = external_blit_bg {
+            Self::encode_blit_pass(&mut encoder, preview_pipeline, bg, preview_view_ref);
+        } else if main_target.is_none() {
+            Self::encode_blit_pass(
+                &mut encoder,
+                preview_pipeline,
+                &self.preview_blit_bg,
+                preview_view_ref,
+            );
+        } else {
+            // `main_target` が ShaderRead 不可の場合はプレビューへ直接選択レイヤーを描画
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("ikakim-preview-direct-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: preview_view_ref,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(preview_pipeline);
+            for layer in &selected {
+                pass.set_bind_group(0, &layer.bind_group, &[]);
+                pass.draw(0..4, 0..1);
+            }
+        }
 
         let cmd = encoder.finish();
         self.ctx.queue.submit(std::iter::once(cmd));
         self.ctx.device.poll(Maintain::Wait);
 
-        let _ = self.main_sink.present_target(main_view, pts);
-        let _ = self.preview_sink.present_target(preview_view, pts);
+        if let Some(mv) = internal_main_view {
+            let _ = self.main_sink.present_target(mv, pts);
+        }
+        if let Some(pv) = internal_preview_view {
+            let _ = self.preview_sink.present_target(pv, pts);
+        }
         let _ = (&self.dummy_tex, &self.dummy_view, &self.preview_blit_uniform);
 
         let elapsed_us = start.elapsed().as_micros() as u64;
@@ -932,6 +1021,43 @@ impl GpuCompositor {
         });
         queue.write_buffer(&buf, 0, &uni.to_bytes());
         buf
+    }
+
+    fn create_render_pipeline(
+        device: &Device,
+        pipeline_layout: &wgpu::PipelineLayout,
+        shader: &wgpu::ShaderModule,
+        format: TextureFormat,
+        label: &str,
+    ) -> RenderPipeline {
+        device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(pipeline_layout),
+            vertex: VertexState {
+                module: shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(FragmentState {
+                module: shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState {
+                    format,
+                    blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        })
     }
 
     fn make_bind_group(

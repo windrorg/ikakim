@@ -1,6 +1,8 @@
 //! macOS / iOS Zero-Copy `CVPixelBuffer` <-> `CVMetalTextureCache` <-> `wgpu::Texture` (`wgpu_hal::api::Metal`)
 
-use core_gpu::{ColorSpace, GpuCompositor, GpuLayer, LayerInputKind};
+use core_gpu::{
+    ColorSpace, ExternalRenderFormat, ExternalRenderTarget, GpuCompositor, GpuLayer, LayerInputKind,
+};
 use core_types::clock::PtsUs;
 use core_types::media::{LayerTransform, NativeBufferHandle, PixelFormat, VideoFrame};
 use core_types::{CoreError, CoreResult};
@@ -40,6 +42,7 @@ extern "C" {
 
     pub fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
     pub fn CFRelease(cf: CFTypeRef);
+    pub fn CFGetRetainCount(cf: CFTypeRef) -> isize;
     pub fn CFDictionaryCreateMutable(
         allocator: CFAllocatorRef,
         capacity: isize,
@@ -64,6 +67,7 @@ extern "C" {
     pub static kCVPixelBufferWidthKey: CFStringRef;
     pub static kCVPixelBufferHeightKey: CFStringRef;
     pub static kCVPixelBufferMetalCompatibilityKey: CFStringRef;
+    pub static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
 
     fn CVPixelBufferCreate(
         allocator: CFAllocatorRef,
@@ -73,6 +77,7 @@ extern "C" {
         pixel_buffer_attributes: CFDictionaryRef,
         pixel_buffer_out: *mut CVPixelBufferRef,
     ) -> CVReturn;
+    fn CVPixelBufferGetIOSurface(pixel_buffer: CVPixelBufferRef) -> *const c_void;
     pub fn CVPixelBufferLockBaseAddress(pixel_buffer: CVPixelBufferRef, lock_flags: u64) -> CVReturn;
     pub fn CVPixelBufferUnlockBaseAddress(
         pixel_buffer: CVPixelBufferRef,
@@ -121,6 +126,25 @@ pub struct CVPixelBufferWrapper {
 
 unsafe impl Send for CVPixelBufferWrapper {}
 
+unsafe fn create_metal_iosurface_pixel_buffer_attrs() -> CFMutableDictionaryRef {
+    let attrs = CFDictionaryCreateMutable(
+        kCFAllocatorDefault,
+        2,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks,
+    );
+    CFDictionarySetValue(attrs, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
+    let io_props = CFDictionaryCreateMutable(
+        kCFAllocatorDefault,
+        0,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks,
+    );
+    CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, io_props as *const c_void);
+    CFRelease(io_props as CFTypeRef);
+    attrs
+}
+
 impl CVPixelBufferWrapper {
     /// 既存の `CVPixelBufferRef` を `CFRetain` して所有権保持する
     ///
@@ -145,17 +169,11 @@ impl CVPixelBufferWrapper {
         Ok(Self { raw })
     }
 
-    /// Metal 互換属性付きの BGRA8 `CVPixelBuffer` を確保し RGBA/BGRA データを書き込む
-    pub fn new_bgra(width: u32, height: u32, bgra_data: &[u8]) -> CoreResult<Self> {
+    /// `IOSurface` + Metal 互換属性付きの空 BGRA8 `CVPixelBuffer` を確保する（GPU レンダーターゲット用・CPU 書き込みなし）
+    pub fn new_bgra_surface(width: u32, height: u32) -> CoreResult<Self> {
         let mut pb: CVPixelBufferRef = ptr::null_mut();
         unsafe {
-            let attrs = CFDictionaryCreateMutable(
-                kCFAllocatorDefault,
-                2,
-                &kCFTypeDictionaryKeyCallBacks,
-                &kCFTypeDictionaryValueCallBacks,
-            );
-            CFDictionarySetValue(attrs, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
+            let attrs = create_metal_iosurface_pixel_buffer_attrs();
             let status = CVPixelBufferCreate(
                 kCFAllocatorDefault,
                 width as usize,
@@ -171,8 +189,14 @@ impl CVPixelBufferWrapper {
                     status
                 )));
             }
+            Ok(Self { raw: pb })
+        }
+    }
 
-            let wrapper = Self { raw: pb };
+    /// Metal 互換属性付きの BGRA8 `CVPixelBuffer` を確保し RGBA/BGRA データを書き込む
+    pub fn new_bgra(width: u32, height: u32, bgra_data: &[u8]) -> CoreResult<Self> {
+        let wrapper = Self::new_bgra_surface(width, height)?;
+        unsafe {
             CVPixelBufferLockBaseAddress(wrapper.raw, 0);
             let dst_base = CVPixelBufferGetBaseAddress(wrapper.raw);
             let dst_stride = CVPixelBufferGetBytesPerRow(wrapper.raw);
@@ -194,13 +218,7 @@ impl CVPixelBufferWrapper {
     pub fn new_nv12(width: u32, height: u32, y_plane: &[u8], uv_plane: &[u8]) -> CoreResult<Self> {
         let mut pb: CVPixelBufferRef = ptr::null_mut();
         unsafe {
-            let attrs = CFDictionaryCreateMutable(
-                kCFAllocatorDefault,
-                2,
-                &kCFTypeDictionaryKeyCallBacks,
-                &kCFTypeDictionaryValueCallBacks,
-            );
-            CFDictionarySetValue(attrs, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
+            let attrs = create_metal_iosurface_pixel_buffer_attrs();
             let status = CVPixelBufferCreate(
                 kCFAllocatorDefault,
                 width as usize,
@@ -259,6 +277,16 @@ impl CVPixelBufferWrapper {
 
     pub fn pixel_format(&self) -> u32 {
         unsafe { CVPixelBufferGetPixelFormatType(self.raw) }
+    }
+
+    /// 背後のハードウェア共有 `IOSurfaceRef` ポインタ（ゼロコピー検証用）
+    pub fn iosurface_ptr(&self) -> *const c_void {
+        unsafe { CVPixelBufferGetIOSurface(self.raw) }
+    }
+
+    /// CoreFoundation リファレンスカウント（プール再利用判定用）
+    pub fn retain_count(&self) -> isize {
+        unsafe { CFGetRetainCount(self.raw as CFTypeRef) }
     }
 
     /// ゼロコピー用の `core_types::media::VideoFrame` を生成する（ポインタ所有権は `self` が保持）
@@ -320,6 +348,195 @@ pub struct ImportedGpuLayer {
     pub layer: GpuLayer,
     cv_tex0: CVMetalTextureRef,
     cv_tex1: CVMetalTextureRef,
+}
+
+impl ImportedGpuLayer {
+    /// 取り込み元 `MTLTexture` が参照している `IOSurfaceRef` ポインタを返す
+    pub fn metal_iosurface_ptr(&self) -> *const c_void {
+        cv_metal_tex_iosurface_ptr(self.cv_tex0)
+    }
+}
+
+/// GPU レンダーパス (`GpuCompositor`) の出力先兼 VideoToolbox 入力となるゼロコピー `IOSurface` サーフェス
+pub struct AppleZeroCopyRenderSlot {
+    pub view: wgpu::TextureView,
+    pub texture: wgpu::Texture,
+    cv_tex: CVMetalTextureRef,
+    pub pixel_buffer: CVPixelBufferWrapper,
+    iosurface: *const c_void,
+    mtl_iosurface: *const c_void,
+}
+
+unsafe impl Send for AppleZeroCopyRenderSlot {}
+
+impl AppleZeroCopyRenderSlot {
+    /// `GpuCompositor::render_dual_into` に渡す外部ターゲット記述子を生成する
+    pub fn as_external_target(&self) -> ExternalRenderTarget<'_> {
+        ExternalRenderTarget {
+            view: &self.view,
+            format: ExternalRenderFormat::Bgra8Unorm,
+            readable_for_preview_blit: true,
+        }
+    }
+
+    pub fn iosurface_ptr(&self) -> *const c_void {
+        self.iosurface
+    }
+
+    pub fn metal_iosurface_ptr(&self) -> *const c_void {
+        self.mtl_iosurface
+    }
+}
+
+impl Drop for AppleZeroCopyRenderSlot {
+    fn drop(&mut self) {
+        if !self.cv_tex.is_null() {
+            unsafe { CFRelease(self.cv_tex as CFTypeRef) };
+            self.cv_tex = ptr::null_mut();
+        }
+    }
+}
+
+/// Metal レンダーターゲットと VideoToolbox 間で `IOSurface` バッファを使い回すゼロコピーリングプール
+pub struct AppleZeroCopyRenderSurfacePool {
+    width: u32,
+    height: u32,
+    slots: Vec<AppleZeroCopyRenderSlot>,
+    cursor: usize,
+    max_slots: usize,
+    allocations_total: u64,
+    reuses_total: u64,
+}
+
+unsafe impl Send for AppleZeroCopyRenderSurfacePool {}
+
+impl AppleZeroCopyRenderSurfacePool {
+    pub fn new(
+        importer: &AppleMetalZeroCopyImporter,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        initial_slots: usize,
+    ) -> CoreResult<Self> {
+        let count = initial_slots.max(2);
+        let max_slots = count.max(16);
+        let mut pool = Self {
+            width,
+            height,
+            slots: Vec::with_capacity(max_slots),
+            cursor: 0,
+            max_slots,
+            allocations_total: 0,
+            reuses_total: 0,
+        };
+        for _ in 0..count {
+            let slot = pool.create_slot(importer, device)?;
+            pool.slots.push(slot);
+        }
+        Ok(pool)
+    }
+
+    fn create_slot(
+        &mut self,
+        importer: &AppleMetalZeroCopyImporter,
+        device: &wgpu::Device,
+    ) -> CoreResult<AppleZeroCopyRenderSlot> {
+        let pb = CVPixelBufferWrapper::new_bgra_surface(self.width, self.height)?;
+        let iosurface = pb.iosurface_ptr();
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC;
+        let (cv_tex, texture) = importer.wrap_plane_with_usage(
+            device,
+            pb.raw(),
+            0,
+            MTL_PIXEL_FORMAT_BGRA8_UNORM,
+            wgpu::TextureFormat::Bgra8Unorm,
+            self.width,
+            self.height,
+            usage,
+            "ikakim-apple-rt-bgra",
+        )?;
+        let mtl_iosurface = cv_metal_tex_iosurface_ptr(cv_tex);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.allocations_total += 1;
+        Ok(AppleZeroCopyRenderSlot {
+            view,
+            texture,
+            cv_tex,
+            pixel_buffer: pb,
+            iosurface,
+            mtl_iosurface,
+        })
+    }
+
+    /// VideoToolbox 側で未参照 (`retain_count == 1`) のスロットをゼロコピー再利用する
+    pub fn acquire_slot(
+        &mut self,
+        importer: &AppleMetalZeroCopyImporter,
+        device: &wgpu::Device,
+    ) -> CoreResult<&AppleZeroCopyRenderSlot> {
+        for attempt in 0..200 {
+            let n = self.slots.len();
+            for offset in 0..n {
+                let idx = (self.cursor + offset) % n;
+                if self.slots[idx].pixel_buffer.retain_count() == 1 {
+                    self.cursor = (idx + 1) % n;
+                    self.reuses_total += 1;
+                    return Ok(&self.slots[idx]);
+                }
+            }
+            if self.slots.len() < self.max_slots {
+                let slot = self.create_slot(importer, device)?;
+                self.slots.push(slot);
+                let idx = self.slots.len() - 1;
+                self.cursor = 0;
+                return Ok(&self.slots[idx]);
+            }
+            if attempt < 199 {
+                std::thread::sleep(std::time::Duration::from_micros(250));
+            }
+        }
+        Err(CoreError::PlatformIo(
+            "AppleZeroCopyRenderSurfacePool: all slots busy in VideoToolbox".into(),
+        ))
+    }
+
+    pub fn allocations_total(&self) -> u64 {
+        self.allocations_total
+    }
+
+    pub fn reuses_total(&self) -> u64 {
+        self.reuses_total
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+}
+
+fn cv_metal_tex_iosurface_ptr(cv_tex: CVMetalTextureRef) -> *const c_void {
+    extern "C" {
+        fn objc_msgSend();
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+    }
+    if cv_tex.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let mtl_ptr = CVMetalTextureGetTexture(cv_tex);
+        if mtl_ptr.is_null() {
+            return ptr::null();
+        }
+        let msg_send: extern "C" fn(*mut c_void, *mut c_void) -> *const c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let sel = sel_registerName(c"iosurface".as_ptr());
+        msg_send(mtl_ptr, sel)
+    }
 }
 
 impl Drop for ImportedGpuLayer {
@@ -495,6 +712,32 @@ impl AppleMetalZeroCopyImporter {
         height: u32,
         label: &str,
     ) -> CoreResult<(CVMetalTextureRef, wgpu::Texture)> {
+        self.wrap_plane_with_usage(
+            device,
+            pb,
+            plane_idx,
+            mtl_fmt,
+            wgpu_fmt,
+            width,
+            height,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+            label,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wrap_plane_with_usage(
+        &self,
+        device: &wgpu::Device,
+        pb: CVPixelBufferRef,
+        plane_idx: usize,
+        mtl_fmt: usize,
+        wgpu_fmt: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        usage: wgpu::TextureUsages,
+        label: &str,
+    ) -> CoreResult<(CVMetalTextureRef, wgpu::Texture)> {
         let mut cv_tex: CVMetalTextureRef = ptr::null_mut();
         let status = unsafe {
             CVMetalTextureCacheCreateTextureFromImage(
@@ -556,7 +799,7 @@ impl AppleMetalZeroCopyImporter {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu_fmt,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage,
                     view_formats: &[],
                 },
             )

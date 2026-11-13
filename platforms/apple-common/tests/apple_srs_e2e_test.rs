@@ -1,7 +1,9 @@
 #![cfg(target_os = "macos")]
 
 use apple_common::audio_toolbox::AudioToolboxAacEncoder;
-use apple_common::cv_metal::{AppleMetalZeroCopyImporter, CVPixelBufferWrapper};
+use apple_common::cv_metal::{
+    AppleMetalZeroCopyImporter, AppleZeroCopyRenderSurfacePool, CVPixelBufferWrapper,
+};
 use apple_common::video_toolbox::VtH264Encoder;
 use core_audio::mixer::{AudioInputConfig, AudioInputProducer, AudioMixer};
 use core_audio::MIX_BLOCK_FRAMES;
@@ -472,8 +474,7 @@ fn forward_loop(
 struct AppleSrsHarness {
     width: u32,
     height: u32,
-    prev_width: u32,
-    prev_height: u32,
+    fps: u32,
     clock: MasterClock,
     mixer: AudioMixer,
     prod0: AudioInputProducer,
@@ -482,20 +483,24 @@ struct AppleSrsHarness {
     server: EmbeddedServer,
     importer: AppleMetalZeroCopyImporter,
     comp: GpuCompositor,
+    main_pool: AppleZeroCopyRenderSurfacePool,
+    prev_pool: AppleZeroCopyRenderSurfacePool,
     main_enc: VtH264Encoder,
     prev_enc: VtH264Encoder,
     aud_enc: AudioToolboxAacEncoder,
     base_video: Option<VirtualVideoSource>,
-    overlay_bgra: Option<(u32, u32, Vec<u8>)>,
+    prebaked_base: Vec<CVPixelBufferWrapper>,
+    overlay_pb: Option<CVPixelBufferWrapper>,
     aud_src0: VirtualAudioSource,
     aud_src1: Option<VirtualAudioSource>,
 }
 
 impl AppleSrsHarness {
     fn new(width: u32, height: u32, initial_bitrate_bps: u32) -> Self {
-        Self::new_with_virtual(
+        Self::new_virtual_with_fps(
             width,
             height,
+            30,
             initial_bitrate_bps,
             None,
             None,
@@ -504,6 +509,7 @@ impl AppleSrsHarness {
                 amplitude: 0.2,
             },
             None,
+            0,
         )
     }
 
@@ -516,25 +522,30 @@ impl AppleSrsHarness {
         aud_signal0: VirtualAudioSignal,
         aud_signal1: Option<VirtualAudioSignal>,
     ) -> Self {
-        Self::new_with_virtual(
+        Self::new_virtual_with_fps(
             width,
             height,
+            30,
             initial_bitrate_bps,
             Some(base_video),
             overlay_video,
             aud_signal0,
             aud_signal1,
+            0,
         )
     }
 
-    fn new_with_virtual(
+    #[allow(clippy::too_many_arguments)]
+    fn new_virtual_with_fps(
         width: u32,
         height: u32,
+        fps: u32,
         initial_bitrate_bps: u32,
         base_video: Option<VirtualVideoSource>,
         overlay_video: Option<VirtualVideoSource>,
         aud_signal0: VirtualAudioSignal,
         aud_signal1: Option<VirtualAudioSignal>,
+        prebake_ring: usize,
     ) -> Self {
         let prev_width = width / 2;
         let prev_height = height / 2;
@@ -569,7 +580,7 @@ impl AppleSrsHarness {
             channels,
             mixer.master_handle(),
             initial_bitrate_bps,
-            30.0,
+            fps as f32,
             TlsRootConfig::System,
         );
         let server = EmbeddedServer::start(
@@ -578,7 +589,7 @@ impl AppleSrsHarness {
                 meter_interval_ms: 50,
                 preview_width: prev_width,
                 preview_height: prev_height,
-                preview_fps: 30,
+                preview_fps: fps,
             },
             bridge.clone(),
         )
@@ -594,27 +605,48 @@ impl AppleSrsHarness {
                 main_height: height,
                 preview_width: prev_width,
                 preview_height: prev_height,
-                target_fps: 30,
+                target_fps: fps,
             },
         );
-        let main_enc = VtH264Encoder::new(width, height, 30, initial_bitrate_bps)
+        let main_pool =
+            AppleZeroCopyRenderSurfacePool::new(&importer, &comp.context().device, width, height, 6)
+                .expect("main AppleZeroCopyRenderSurfacePool");
+        let prev_pool = AppleZeroCopyRenderSurfacePool::new(
+            &importer,
+            &comp.context().device,
+            prev_width,
+            prev_height,
+            6,
+        )
+        .expect("prev AppleZeroCopyRenderSurfacePool");
+        let main_enc = VtH264Encoder::new(width, height, fps, initial_bitrate_bps)
             .expect("VtH264Encoder main");
-        let prev_enc = VtH264Encoder::new(prev_width, prev_height, 30, initial_bitrate_bps / 4)
+        let prev_enc = VtH264Encoder::new(prev_width, prev_height, fps, initial_bitrate_bps / 4)
             .expect("VtH264Encoder preview");
         let aud_enc = AudioToolboxAacEncoder::new(128_000).expect("AudioToolboxAacEncoder");
 
-        let overlay_bgra = overlay_video.map(|src| {
+        let prebaked_base = match (&base_video, prebake_ring) {
+            (Some(src), n) if n > 0 => (0..n as u64)
+                .map(|k| {
+                    let (y, uv) = src.render_nv12_bt709(k);
+                    CVPixelBufferWrapper::new_nv12(width, height, &y, &uv)
+                        .expect("prebaked NV12 CVPixelBuffer")
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        let overlay_pb = overlay_video.map(|src| {
             let w = src.width;
             let h = src.height;
             let bytes = src.render_bgra(0);
-            (w, h, bytes)
+            CVPixelBufferWrapper::new_bgra(w, h, &bytes).expect("CVPixelBufferWrapper bgra")
         });
 
         Self {
             width,
             height,
-            prev_width,
-            prev_height,
+            fps,
             clock,
             mixer,
             prod0,
@@ -623,59 +655,69 @@ impl AppleSrsHarness {
             server,
             importer,
             comp,
+            main_pool,
+            prev_pool,
             main_enc,
             prev_enc,
             aud_enc,
             base_video,
-            overlay_bgra,
+            prebaked_base,
+            overlay_pb,
             aud_src0: VirtualAudioSource::new(48_000, aud_signal0),
             aud_src1,
         }
     }
 
+    fn frame_delay_ms(&self) -> u64 {
+        if self.fps >= 60 { 16 } else { 33 }
+    }
+
     fn step(&mut self, frame_idx: u64, high_entropy: bool) {
-        let w = self.width as usize;
-        let h = self.height as usize;
-        let (y_plane, uv_plane) = if let Some(src) = &self.base_video {
-            src.render_nv12_bt709(frame_idx)
-        } else if high_entropy {
-            let mut y_plane = vec![0u8; w * h];
-            let mut uv_plane = vec![128u8; w * (h / 2)];
-            // Deterministic pseudo-random textured pattern so VideoToolbox generates larger P/I slices under ABR test
-            for row in 0..h {
-                for col in 0..w {
-                    let seed = ((row as u32)
-                        .wrapping_mul(1664525)
-                        ^ (col as u32).wrapping_mul(1013904223)
-                        ^ (frame_idx as u32).wrapping_mul(2246822519))
-                        >> 16;
-                    y_plane[row * w + col] = (16 + (seed % 219)) as u8;
-                    if row % 2 == 0 && col % 2 == 0 {
-                        uv_plane[(row / 2) * w + col] = ((seed >> 2) % 220) as u8;
-                        uv_plane[(row / 2) * w + col + 1] = ((seed >> 5) % 220) as u8;
+        let owned_pb;
+        let base_pb = if !self.prebaked_base.is_empty() {
+            &self.prebaked_base[(frame_idx as usize) % self.prebaked_base.len()]
+        } else {
+            let w = self.width as usize;
+            let h = self.height as usize;
+            let (y_plane, uv_plane) = if let Some(src) = &self.base_video {
+                src.render_nv12_bt709(frame_idx)
+            } else if high_entropy {
+                let mut y_plane = vec![0u8; w * h];
+                let mut uv_plane = vec![128u8; w * (h / 2)];
+                for row in 0..h {
+                    for col in 0..w {
+                        let seed = ((row as u32)
+                            .wrapping_mul(1664525)
+                            ^ (col as u32).wrapping_mul(1013904223)
+                            ^ (frame_idx as u32).wrapping_mul(2246822519))
+                            >> 16;
+                        y_plane[row * w + col] = (16 + (seed % 219)) as u8;
+                        if row % 2 == 0 && col % 2 == 0 {
+                            uv_plane[(row / 2) * w + col] = ((seed >> 2) % 220) as u8;
+                            uv_plane[(row / 2) * w + col + 1] = ((seed >> 5) % 220) as u8;
+                        }
                     }
                 }
-            }
-            (y_plane, uv_plane)
-        } else {
-            VirtualVideoSource::new(self.width, self.height, VirtualVideoPattern::ColorbarsMotion)
-                .render_nv12_bt709(frame_idx)
+                (y_plane, uv_plane)
+            } else {
+                VirtualVideoSource::new(self.width, self.height, VirtualVideoPattern::ColorbarsMotion)
+                    .render_nv12_bt709(frame_idx)
+            };
+            owned_pb = CVPixelBufferWrapper::new_nv12(self.width, self.height, &y_plane, &uv_plane)
+                .expect("CVPixelBufferWrapper::new_nv12");
+            &owned_pb
         };
 
-        let pb = CVPixelBufferWrapper::new_nv12(self.width, self.height, &y_plane, &uv_plane)
-            .expect("CVPixelBufferWrapper::new_nv12");
         let imported_base = self
             .importer
-            .import_to_gpu_layer(&self.comp, &pb, 0, true, self.bridge.layer_transform(0))
+            .import_to_gpu_layer(&self.comp, base_pb, 0, true, self.bridge.layer_transform(0))
             .expect("import_to_gpu_layer base");
 
-        let imported_overlay = self.overlay_bgra.as_ref().map(|(ow, oh, bgra)| {
-            let ov_pb =
-                CVPixelBufferWrapper::new_bgra(*ow, *oh, bgra).expect("CVPixelBufferWrapper bgra");
+        let imported_overlay = self.overlay_pb.as_ref().map(|ov_pb| {
             self.importer
                 .import_to_gpu_layer(
                     &self.comp,
-                    &ov_pb,
+                    ov_pb,
                     1,
                     false,
                     self.bridge.layer_transform(1),
@@ -683,36 +725,48 @@ impl AppleSrsHarness {
                 .expect("import_to_gpu_layer overlay")
         });
 
-        let pts = PtsUs(frame_idx * 33_333);
+        let pts = PtsUs(frame_idx * (1_000_000 / self.fps as u64));
+        let main_slot = self
+            .main_pool
+            .acquire_slot(&self.importer, &self.comp.context().device)
+            .expect("acquire main IOSurface slot");
+        let prev_slot = self
+            .prev_pool
+            .acquire_slot(&self.importer, &self.comp.context().device)
+            .expect("acquire prev IOSurface slot");
+
         if let Some(ov) = &imported_overlay {
             self.comp
-                .render_dual(&[&imported_base.layer, &ov.layer], pts)
-                .expect("render_dual");
+                .render_dual_into(
+                    &[&imported_base.layer, &ov.layer],
+                    pts,
+                    Some(main_slot.as_external_target()),
+                    Some(prev_slot.as_external_target()),
+                )
+                .expect("render_dual_into multilayer");
         } else {
             self.comp
-                .render_dual(&[&imported_base.layer], pts)
-                .expect("render_dual");
+                .render_dual_into(
+                    &[&imported_base.layer],
+                    pts,
+                    Some(main_slot.as_external_target()),
+                    Some(prev_slot.as_external_target()),
+                )
+                .expect("render_dual_into single");
         }
         self.importer.flush();
 
-        let main_rgba = self
-            .comp
-            .readback_texture_rgba(self.comp.main_texture(), self.width, self.height)
-            .expect("readback main");
+        // Zero-copy CVPixelBuffer -> VideoToolbox hardware encode (no GPU readback or CPU swizzle)
         self.main_enc
-            .encode_rgba(self.width, self.height, &main_rgba, pts)
-            .expect("vt encode main");
-
-        let prev_rgba = self
-            .comp
-            .readback_texture_rgba(self.comp.preview_texture(), self.prev_width, self.prev_height)
-            .expect("readback prev");
+            .encode_pixel_buffer(&main_slot.pixel_buffer, pts)
+            .expect("vt encode_pixel_buffer main");
         self.prev_enc
-            .encode_rgba(self.prev_width, self.prev_height, &prev_rgba, pts)
-            .expect("vt encode prev");
+            .encode_pixel_buffer(&prev_slot.pixel_buffer, pts)
+            .expect("vt encode_pixel_buffer prev");
 
-        // Feed exact 48kHz audio alongside 30fps video: MIX_BLOCK_FRAMES=480 (10ms), so 4,3,3 blocks = 100ms per 3 frames
-        let blocks = VirtualAudioSource::mix_blocks_for_30fps_frame(frame_idx);
+        // Feed exact 48kHz audio synchronized to target fps (30fps: 4,3,3 / 60fps: 2,2,1)
+        let blocks = VirtualAudioSource::mix_blocks_for_fps_frame(self.fps, frame_idx);
+        let mut mix_buf = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
         for _ in 0..blocks {
             let pcm0 = self.aud_src0.next_stereo_f32(MIX_BLOCK_FRAMES);
             self.prod0.push_f32(&pcm0);
@@ -720,7 +774,6 @@ impl AppleSrsHarness {
                 let pcm1 = s1.next_stereo_f32(MIX_BLOCK_FRAMES);
                 p1.push_f32(&pcm1);
             }
-            let mut mix_buf = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
             let st = self.mixer.mix_block(&mut mix_buf);
             self.aud_enc
                 .push_pcm_f32(&mix_buf, st.to_pts_us())
@@ -752,13 +805,14 @@ impl AppleSrsHarness {
     {
         let deadline = Instant::now() + timeout;
         let mut idx = start_idx;
+        let delay = self.frame_delay_ms();
         while Instant::now() < deadline {
             self.step(idx, high_entropy);
             idx += 1;
             if predicate(&self.bridge) {
                 return (idx, true);
             }
-            thread::sleep(Duration::from_millis(33));
+            thread::sleep(Duration::from_millis(delay));
         }
         (idx, false)
     }
@@ -781,11 +835,12 @@ fn verify_http_flv_with_ffprobe(
     expected_w: u32,
     expected_h: u32,
 ) {
-    // Allow at least ~20 frames (~660ms) of live A+V packets to enter SRS GOP cache before opening HTTP-FLV viewer
+    let delay = harness.frame_delay_ms();
+    // Allow at least ~20 frames of live A+V packets to enter SRS GOP cache before opening HTTP-FLV viewer
     for _ in 0..20 {
         harness.step(*frame_idx, false);
         *frame_idx += 1;
-        thread::sleep(Duration::from_millis(33));
+        thread::sleep(Duration::from_millis(delay));
     }
 
     let probe_bin = ffprobe_bin.to_path_buf();
@@ -815,10 +870,11 @@ fn verify_http_flv_with_ffprobe(
     });
 
     let deadline = Instant::now() + Duration::from_secs(12);
+    let delay = harness.frame_delay_ms();
     while !done.load(Ordering::Acquire) && Instant::now() < deadline {
         harness.step(*frame_idx, false);
         *frame_idx += 1;
-        thread::sleep(Duration::from_millis(33));
+        thread::sleep(Duration::from_millis(delay));
     }
 
     let out = handle.join().expect("join ffprobe thread");
@@ -1284,10 +1340,11 @@ fn capture_and_decode_flv_segment(
     pre_roll_frames: usize,
     duration_secs: f32,
 ) -> DecodedFlvSegment {
+    let delay = harness.frame_delay_ms();
     for _ in 0..pre_roll_frames {
         harness.step(*frame_idx, false);
         *frame_idx += 1;
-        thread::sleep(Duration::from_millis(33));
+        thread::sleep(Duration::from_millis(delay));
     }
 
     let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1344,10 +1401,11 @@ fn capture_and_decode_flv_segment(
     });
 
     let deadline = Instant::now() + Duration::from_secs(15);
+    let delay = harness.frame_delay_ms();
     while !done.load(Ordering::Acquire) && Instant::now() < deadline {
         harness.step(*frame_idx, false);
         *frame_idx += 1;
-        thread::sleep(Duration::from_millis(33));
+        thread::sleep(Duration::from_millis(delay));
     }
 
     let out = handle.join().expect("join ffmpeg decode thread");
@@ -1701,6 +1759,178 @@ fn test_srs_e2e_delivered_overlay_transform_and_audio_gain_mute_via_ws_rpc() {
         rms_l,
         rms_r
     );
+
+    harness.shutdown();
+}
+
+#[test]
+fn test_srs_e2e_1080p60_zero_copy_multilayer_streaming_and_abr() {
+    let Some((srs_bin, ffprobe_bin, ffmpeg_bin)) = require_or_skip_srs_ffprobe_ffmpeg() else {
+        return;
+    };
+    let srs = SrsProcess::start(srs_bin);
+    let width = 1920u32;
+    let height = 1080u32;
+    let base_video =
+        VirtualVideoSource::new(width, height, VirtualVideoPattern::default()).with_bar_speed(16);
+    let overlay_video =
+        VirtualVideoSource::new(256, 256, VirtualVideoPattern::Solid([235, 30, 210, 255]));
+
+    let mut harness = AppleSrsHarness::new_virtual_with_fps(
+        width,
+        height,
+        60,
+        6_000_000,
+        Some(base_video),
+        Some(overlay_video),
+        VirtualAudioSignal::SineTone {
+            freq_hz: 500.0,
+            amplitude: 0.35,
+        },
+        Some(VirtualAudioSignal::SineTone {
+            freq_hz: 1000.0,
+            amplitude: 0.35,
+        }),
+        12,
+    );
+
+    send_ws_rpc_sequence(
+        harness.server.local_addr(),
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"overlay.set_transform","params":{"layer_id":1,"x":0.5,"y":-0.5,"scale_x":0.35,"scale_y":0.35,"opacity":1.0,"rotation_rad":0.0,"visible":true}}"#,
+        ],
+    );
+
+    let rtmp_url = srs.rtmp_url("live", "e2e_1080p60");
+    harness
+        .bridge
+        .start_stream(&rtmp_url, None)
+        .expect("start_stream 1080p60");
+
+    let mut frame_idx = 0u64;
+    let (_, connected) = harness.pump_until(0, Duration::from_secs(6), false, |b| {
+        b.snapshot().state == PipelineState::Streaming
+    });
+    assert!(connected, "expected 1080p60 RTMP publisher to enter Streaming state");
+    frame_idx += 20; // account for warmup ticks
+
+    // Benchmark 120 live 1080p60 zero-copy frames streaming to real local SRS v6
+    let mut step_ms = Vec::with_capacity(120);
+    for _ in 0..120 {
+        let t0 = Instant::now();
+        harness.step(frame_idx, false);
+        step_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+        frame_idx += 1;
+    }
+    let avg_step_ms = step_ms.iter().sum::<f64>() / step_ms.len() as f64;
+    eprintln!(
+        "[SRS E2E 1080p60 zero-copy] avg_step={avg_step_ms:.2}ms main_pool(alloc={}, reuse={}) prev_pool(alloc={}, reuse={})",
+        harness.main_pool.allocations_total(),
+        harness.main_pool.reuses_total(),
+        harness.prev_pool.allocations_total(),
+        harness.prev_pool.reuses_total(),
+    );
+
+    assert!(
+        avg_step_ms < 16.67,
+        "1080p60 SRS E2E step avg {avg_step_ms:.2}ms exceeded 16.67ms 60fps budget"
+    );
+    assert!(
+        harness.main_pool.allocations_total() <= 6 && harness.prev_pool.allocations_total() <= 6,
+        "1080p60 zero-copy pool over-allocated: main={} prev={}",
+        harness.main_pool.allocations_total(),
+        harness.prev_pool.allocations_total(),
+    );
+    assert!(
+        harness.main_pool.reuses_total() >= 115,
+        "expected >= 115 main surface reuses, got {}",
+        harness.main_pool.reuses_total()
+    );
+
+    // 1. Verify SRS live HTTP-FLV metadata & 1920x1080 H.264 + 48kHz stereo AAC via ffprobe
+    let flv_url = srs.flv_url("live", "e2e_1080p60");
+    verify_http_flv_with_ffprobe(
+        &srs,
+        &ffprobe_bin,
+        &flv_url,
+        &mut harness,
+        &mut frame_idx,
+        width,
+        height,
+    );
+
+    // 2. Decode real 1080p60 RGB frames + PCM audio delivered through SRS HTTP-FLV
+    let seg = capture_and_decode_flv_segment(
+        &ffmpeg_bin,
+        &flv_url,
+        &mut harness,
+        &mut frame_idx,
+        30,
+        1.5,
+    );
+    assert!(
+        !seg.video_rgb_frames.is_empty(),
+        "expected decoded 1080p60 RGB frames from SRS HTTP-FLV"
+    );
+    let f = seg.video_rgb_frames.last().expect("1080p frame");
+    let tl = rgb_pixel(f, width, width / 4, height / 4);
+    let tr = rgb_pixel(f, width, width * 3 / 4, height / 4);
+    let bl = rgb_pixel(f, width, width / 4, height * 3 / 4);
+    let br = rgb_pixel(f, width, width * 3 / 4, height * 3 / 4);
+    assert!(
+        tl[0] > 165 && tl[1] < 85 && tl[2] < 85,
+        "1080p60 TL expected Red, got {:?}",
+        tl
+    );
+    assert!(
+        tr[1] > 155 && tr[0] < 85,
+        "1080p60 TR expected Green, got {:?}",
+        tr
+    );
+    assert!(
+        bl[2] > 165 && bl[0] < 85,
+        "1080p60 BL expected Blue, got {:?}",
+        bl
+    );
+    assert!(
+        br[0] > 165 && br[1] < 90 && br[2] > 145,
+        "1080p60 BR expected Magenta overlay, got {:?}",
+        br
+    );
+
+    let aud_slice = &seg.audio_pcm_stereo[seg.audio_pcm_stereo.len() / 2..];
+    let mag_500 = goertzel_magnitude(aud_slice, 2, 0, 48_000.0, 500.0);
+    let mag_1000 = goertzel_magnitude(aud_slice, 2, 0, 48_000.0, 1000.0);
+    assert!(
+        mag_500 > 0.05 && mag_1000 > 0.05,
+        "1080p60 audio expected mixed 500Hz+1000Hz tones (500Hz={mag_500}, 1000Hz={mag_1000})"
+    );
+
+    // 3. Apply ABR target adjustment + confirm sustained streaming with 0 dropped frames
+    harness
+        .bridge
+        .apply_abr_bitrate(3_000_000, &mut harness.main_enc)
+        .expect("apply_abr_bitrate");
+    assert_eq!(harness.bridge.snapshot().bitrate_bps, 3_000_000);
+    VideoEncoder::request_keyframe(&mut harness.main_enc);
+    let delay = harness.frame_delay_ms();
+    for _ in 0..30 {
+        harness.step(frame_idx, false);
+        frame_idx += 1;
+        thread::sleep(Duration::from_millis(delay));
+    }
+    let (next_idx, steady) = harness.pump_until(frame_idx, Duration::from_secs(4), false, |b| {
+        b.snapshot().state == PipelineState::Streaming
+    });
+    let _ = next_idx;
+    assert!(steady, "expected 1080p60 stream to remain Streaming after ABR change");
+    let pstats = harness
+        .bridge
+        .publisher_stats()
+        .expect("publisher_stats during 1080p60");
+    assert!(pstats.packets_sent > 120);
+    // AIMD may immediately probe upward on zero-congestion localhost SRS after the explicit drop
+    assert!(harness.bridge.snapshot().bitrate_bps >= 3_000_000);
 
     harness.shutdown();
 }

@@ -153,6 +153,76 @@ fn capi_apple_cv_pixel_buffer_zero_copy_path() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[test]
+fn capi_1080p60_apple_zero_copy_engine_test() {
+    use apple_common::cv_metal::CVPixelBufferWrapper;
+    use ffi_capi::ikakim_engine_submit_cv_pixel_buffer;
+    use std::time::Instant;
+
+    let mut cfg = ikakim_engine_default_config();
+    cfg.main_width = 1920;
+    cfg.main_height = 1080;
+    cfg.preview_width = 960;
+    cfg.preview_height = 540;
+    cfg.target_fps = 60;
+    cfg.initial_bitrate_bps = 6_000_000;
+    cfg.http_port = 0;
+
+    unsafe {
+        let handle = ikakim_engine_create(&cfg);
+        assert!(!handle.is_null());
+
+        // Pre-bake 4 NV12 1080p CVPixelBuffers so CPU generation does not skew tick latency
+        let pbs: Vec<CVPixelBufferWrapper> = (0..4u8)
+            .map(|k| {
+                let y = vec![80u8.saturating_add(k * 20); 1920 * 1080];
+                let uv = vec![128u8; 1920 * 540];
+                CVPixelBufferWrapper::new_nv12(1920, 1080, &y, &uv).expect("create 1080p NV12 PB")
+            })
+            .collect();
+        let audio_block = vec![0.15f32; 480 * 2];
+
+        const WARMUP: usize = 6;
+        const MEASURED: usize = 60;
+        let mut total_ms = 0.0f64;
+
+        for idx in 0..(WARMUP + MEASURED) {
+            let t0 = Instant::now();
+            let pb = &pbs[idx % pbs.len()];
+            assert_eq!(ikakim_engine_submit_cv_pixel_buffer(handle, 0, true, pb.raw()), 0);
+            let blocks = if idx % 3 == 2 { 1 } else { 2 };
+            for _ in 0..blocks {
+                assert_eq!(
+                    ikakim_engine_push_audio_f32(handle, 0, audio_block.as_ptr(), audio_block.len()),
+                    0
+                );
+            }
+            assert_eq!(ikakim_engine_step_tick(handle, 0, 12), 0);
+            if idx >= WARMUP {
+                total_ms += t0.elapsed().as_secs_f64() * 1000.0;
+            }
+        }
+
+        let avg_ms = total_ms / MEASURED as f64;
+        eprintln!("[C-API 1080p60 zero-copy] avg_tick={avg_ms:.2}ms");
+
+        let mut stats = IkakimEngineStats::default();
+        assert_eq!(ikakim_engine_get_stats(handle, &mut stats), 0);
+        assert!(stats.apple_zero_copy_active, "Apple zero-copy pipeline must be active");
+        assert_eq!(stats.ticks, (WARMUP + MEASURED) as u64);
+        assert_eq!(stats.active_gpu_layers, 1);
+        assert!(stats.encoded_video_packets > 0, "expected VideoToolbox zero-copy encoded packets");
+        assert!(stats.encoded_audio_packets > 0, "expected AAC encoded audio packets");
+        assert!(
+            avg_ms < 16.67,
+            "C-API 1080p60 zero-copy avg tick {avg_ms:.2}ms >= 16.67ms"
+        );
+
+        ikakim_engine_destroy(handle);
+    }
+}
+
 #[test]
 fn capi_portable_jni_create_and_destroy_smoke() {
     let raw = portable_create(64, 64, 32, 32, 30, 1_500_000, 0);
