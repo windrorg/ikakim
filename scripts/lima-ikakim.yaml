@@ -42,5 +42,5 @@ provision:
       printf "vivid\nsnd-aloop\n" > /etc/modules-load.d/live-streamer.conf
       printf "options vivid no_error_inj=1\noptions snd-aloop enable=1,1 index=10,11\n" > /etc/modprobe.d/live-streamer.conf
       if [ -n "${LIMA_CIDATA_USER:-}" ]; then
-        usermod -aG video,audio "${LIMA_CIDATA_USER}" || true
+        usermod -aG video,audio,render "${LIMA_CIDATA_USER}" || true
       fi
