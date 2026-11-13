@@ -13,6 +13,7 @@ members = [
     "platforms/linux-common",
     "platforms/linux-vm",
     "platforms/linux-arm64",
+    "platforms/android-native",
 ]
 
 [workspace.package]

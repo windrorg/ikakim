@@ -10,4 +10,11 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 core-types.workspace = true
+core-audio.workspace = true
+core-gpu.workspace = true
+core-rtmp.workspace = true
+core-net-ui.workspace = true
 core-engine.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+apple-common = { path = "../../platforms/apple-common" }

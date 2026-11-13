@@ -3,6 +3,19 @@
 version = 3
 
 [[package]]
+name = "android-native"
+version = "0.1.0"
+dependencies = [
+ "core-audio",
+ "core-engine",
+ "core-gpu",
+ "core-rtmp",
+ "core-types",
+ "wgpu",
+ "wgpu-hal",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -210,7 +223,12 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 name = "ffi-capi"
 version = "0.1.0"
 dependencies = [
+ "apple-common",
+ "core-audio",
  "core-engine",
+ "core-gpu",
+ "core-net-ui",
+ "core-rtmp",
  "core-types",
 ]
 

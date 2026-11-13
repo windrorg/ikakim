@@ -1,0 +1,4 @@
+module IkakimFFI {
+    header "../../crates/ffi-capi/include/ikakim_ffi.h"
+    export *
+}
