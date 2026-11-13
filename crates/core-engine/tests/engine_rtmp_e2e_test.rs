@@ -791,9 +791,11 @@ fn test_engine_max_reconnect_exhaustion_transitions_to_error_and_recovers() {
         .start_stream(&format!("rtmp://127.0.0.1:{}/live/recovered", healthy_port), Some(800_000))
         .expect("recover start_stream from Error state");
 
-    for i in 0..8u64 {
+    let recover_deadline = Instant::now() + Duration::from_secs(3);
+    let mut rec_i = 0u64;
+    while Instant::now() < recover_deadline {
         step_pipeline_frame(
-            i,
+            rec_i,
             &mut clock,
             &mut mixer,
             &mut prod0,
@@ -804,11 +806,20 @@ fn test_engine_max_reconnect_exhaustion_transitions_to_error_and_recovers() {
             &mut aud_enc,
             &server,
         );
-        thread::sleep(Duration::from_millis(15));
+        rec_i += 1;
+        if bridge.snapshot().state == PipelineState::Streaming
+            && bridge
+                .publisher_stats()
+                .is_some_and(|s| s.packets_sent >= 4)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
     }
 
     assert_eq!(bridge.snapshot().state, PipelineState::Streaming);
-    assert!(bridge.publisher_stats().unwrap().packets_sent >= 4);
+    let sent = bridge.publisher_stats().unwrap().packets_sent;
+    assert!(sent >= 4, "expected packets_sent >= 4 after recovery, got {}", sent);
 
     bridge.stop_all();
     server.stop();
