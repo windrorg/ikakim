@@ -35,12 +35,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p platform-macos -- --frames 30 127.0.0.1:0
 ```
 
-### 2. iOS ターゲット（`aarch64-apple-ios` / `aarch64-apple-ios-sim` + Swift 型チェック）
+### 2. iOS ターゲット（`aarch64-apple-ios` / `aarch64-apple-ios-sim` + XCFramework + Swift 型チェック）
 ```bash
-cargo build -p ffi-capi --target aarch64-apple-ios
-cargo build -p ffi-capi --target aarch64-apple-ios-sim
+./scripts/build-ios-xcframework.sh
 xcrun --sdk iphoneos swiftc -typecheck -target arm64-apple-ios16.0 -I platforms/ios platforms/ios/*.swift
 xcrun --sdk iphonesimulator swiftc -typecheck -target arm64-apple-ios16.0-simulator -I platforms/ios platforms/ios/*.swift
+# XcodeGen 利用時: build/ios/IkakimFFI.xcframework を生成後、platforms/ios/project.yml で .xcodeproj 生成可能
 ```
 
 ### 3. Linux arm64 / Lima VM（V4L2 `vivid`/`vicodec` DMA-BUF / ALSA `snd-aloop` / Surfaceless EGL & Vulkan）

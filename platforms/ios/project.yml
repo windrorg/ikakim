@@ -1,0 +1,30 @@
+name: IkakimIosHost
+options:
+  bundleIdPrefix: com.ikakim.live
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  IkakimIosHost:
+    type: application
+    platform: iOS
+    sources:
+      - path: AVCaptureCameraBridge.swift
+      - path: IkakimEngine.swift
+      - path: IkakimWebViewApp.swift
+    settings:
+      base:
+        INFOPLIST_FILE: platforms/ios/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.ikakim.live.ios
+        SWIFT_VERSION: "5.0"
+        ENABLE_BITCODE: NO
+    dependencies:
+      - xcframework: ../../build/ios/IkakimFFI.xcframework
+      - sdk: AVFoundation.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: Metal.framework
+      - sdk: VideoToolbox.framework
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudio.framework
+      - sdk: ImageIO.framework
+      - sdk: WebKit.framework
