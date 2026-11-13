@@ -479,6 +479,7 @@ impl IkakimEngineHandle {
         }
 
         // Render & encode main + preview targets (Apple Metal->IOSurface->VT zero-copy when active)
+        #[allow(unused_mut)]
         let mut rendered_via_apple_zero_copy = false;
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let (
