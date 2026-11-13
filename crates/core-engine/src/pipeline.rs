@@ -129,6 +129,17 @@ impl EngineControlBridge {
         self.inner.lock().unwrap().bitrate_bps = bps;
     }
 
+    /// ABR 決定ビットレートを HW/SW エンコーダと制御ブリッジ双方へ即時反映する
+    pub fn apply_abr_bitrate(
+        &self,
+        target_bps: u32,
+        main_encoder: &mut dyn VideoEncoder,
+    ) -> CoreResult<()> {
+        main_encoder.set_target_bitrate(target_bps)?;
+        self.set_current_bitrate(target_bps);
+        Ok(())
+    }
+
     pub fn stop_all(&self) {
         let mut g = self.inner.lock().unwrap();
         if let Some(mut p) = g.publisher.take() {

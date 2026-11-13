@@ -29,6 +29,10 @@ const EGL_DMA_BUF_PLANE0_FD_EXT: i32 = 0x3272;
 const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
 const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
 const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8d65;
+const GL_VERSION: u32 = 0x1f02;
+const GL_EXTENSIONS: u32 = 0x1f03;
+const GL_FRAGMENT_SHADER: u32 = 0x8b30;
+const GL_COMPILE_STATUS: u32 = 0x8b81;
 const GL_NO_ERROR: u32 = 0;
 
 // DRM FourCC
@@ -69,9 +73,15 @@ type FnGlGenTextures = unsafe extern "C" fn(i32, *mut c_uint);
 type FnGlDeleteTextures = unsafe extern "C" fn(i32, *const c_uint);
 type FnGlBindTexture = unsafe extern "C" fn(u32, c_uint);
 type FnGlGetError = unsafe extern "C" fn() -> u32;
+type FnGlGetString = unsafe extern "C" fn(u32) -> *const u8;
+type FnGlCreateShader = unsafe extern "C" fn(u32) -> c_uint;
+type FnGlShaderSource = unsafe extern "C" fn(c_uint, i32, *const *const c_char, *const i32);
+type FnGlCompileShader = unsafe extern "C" fn(c_uint);
+type FnGlGetShaderiv = unsafe extern "C" fn(c_uint, u32, *mut i32);
+type FnGlDeleteShader = unsafe extern "C" fn(c_uint);
 type FnGlEglImageTargetTexture2DOes = unsafe extern "C" fn(u32, EglImageKHR);
 
-/// Mesa `EGL_PLATFORM_SURFACELESS_MESA` + GLES3 による `EGL_EXT_image_dma_buf_import` コンテキスト
+/// Mesa `EGL_PLATFORM_SURFACELESS_MESA` + GLES 3.2 による `EGL_EXT_image_dma_buf_import` コンテキスト
 pub struct SurfacelessEglDmaBuf {
     lib_egl: *mut c_void,
     lib_gles: *mut c_void,
@@ -87,6 +97,12 @@ pub struct SurfacelessEglDmaBuf {
     gl_delete_textures: FnGlDeleteTextures,
     gl_bind_texture: FnGlBindTexture,
     gl_get_error: FnGlGetError,
+    gl_get_string: FnGlGetString,
+    gl_create_shader: FnGlCreateShader,
+    gl_shader_source: FnGlShaderSource,
+    gl_compile_shader: FnGlCompileShader,
+    gl_get_shaderiv: FnGlGetShaderiv,
+    gl_delete_shader: FnGlDeleteShader,
     gl_image_target_tex: FnGlEglImageTargetTexture2DOes,
 }
 
@@ -152,6 +168,12 @@ impl SurfacelessEglDmaBuf {
             let gl_delete_textures = load_gl!(c"glDeleteTextures", FnGlDeleteTextures);
             let gl_bind_texture = load_gl!(c"glBindTexture", FnGlBindTexture);
             let gl_get_error = load_gl!(c"glGetError", FnGlGetError);
+            let gl_get_string = load_gl!(c"glGetString", FnGlGetString);
+            let gl_create_shader = load_gl!(c"glCreateShader", FnGlCreateShader);
+            let gl_shader_source = load_gl!(c"glShaderSource", FnGlShaderSource);
+            let gl_compile_shader = load_gl!(c"glCompileShader", FnGlCompileShader);
+            let gl_get_shaderiv = load_gl!(c"glGetShaderiv", FnGlGetShaderiv);
+            let gl_delete_shader = load_gl!(c"glDeleteShader", FnGlDeleteShader);
 
             let p_get_plat = egl_get_proc(c"eglGetPlatformDisplayEXT".as_ptr());
             let p_create_img = egl_get_proc(c"eglCreateImageKHR".as_ptr());
@@ -231,8 +253,51 @@ impl SurfacelessEglDmaBuf {
                 gl_delete_textures,
                 gl_bind_texture,
                 gl_get_error,
+                gl_get_string,
+                gl_create_shader,
+                gl_shader_source,
+                gl_compile_shader,
+                gl_get_shaderiv,
+                gl_delete_shader,
                 gl_image_target_tex,
             })
+        }
+    }
+
+    /// 現在の Surfaceless EGL GLES コンテキストのバージョン文字列を返す (例: `OpenGL ES 3.2 ...`)
+    pub fn gles_version(&self) -> String {
+        unsafe {
+            let p = (self.gl_get_string)(GL_VERSION) as *const c_char;
+            if p.is_null() {
+                return String::new();
+            }
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+
+    /// Amlogic S905X2 / Mesa 向け `GL_OES_EGL_image_external_essl3` シェーダーがコンパイル可能か検証する
+    pub fn verify_gles32_external_shader(&self) -> CoreResult<bool> {
+        unsafe {
+            let ext_p = (self.gl_get_string)(GL_EXTENSIONS) as *const c_char;
+            if ext_p.is_null() {
+                return Ok(false);
+            }
+            let exts = CStr::from_ptr(ext_p).to_string_lossy();
+            if !exts.contains("GL_OES_EGL_image_external_essl3") {
+                return Ok(false);
+            }
+            let sh = (self.gl_create_shader)(GL_FRAGMENT_SHADER);
+            if sh == 0 {
+                return Ok(false);
+            }
+            let src = c"#version 300 es\n#extension GL_OES_EGL_image_external_essl3 : require\nprecision mediump float;\nuniform samplerExternalOES u_tex;\nin vec2 v_uv;\nout vec4 o_col;\nvoid main() { o_col = texture(u_tex, v_uv); }\n";
+            let ptrs = [src.as_ptr()];
+            (self.gl_shader_source)(sh, 1, ptrs.as_ptr(), ptr::null());
+            (self.gl_compile_shader)(sh);
+            let mut ok = 0i32;
+            (self.gl_get_shaderiv)(sh, GL_COMPILE_STATUS, &mut ok);
+            (self.gl_delete_shader)(sh);
+            Ok(ok != 0)
         }
     }
 
@@ -380,6 +445,10 @@ impl LinuxDmaBufImporter {
 
     pub fn has_surfaceless_egl(&self) -> bool {
         self.egl.is_some()
+    }
+
+    pub fn surfaceless_egl(&self) -> Option<&SurfacelessEglDmaBuf> {
+        self.egl.as_ref()
     }
 
     pub fn has_vulkan_dmabuf_extension(&self) -> bool {

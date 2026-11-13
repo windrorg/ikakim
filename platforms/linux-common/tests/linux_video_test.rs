@@ -23,6 +23,24 @@ use std::sync::Mutex;
 
 static VIVID_LOCK: Mutex<()> = Mutex::new(());
 
+extern "C" {
+    fn open(path: *const std::os::raw::c_char, oflag: std::os::raw::c_int, ...) -> std::os::raw::c_int;
+    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+#[allow(dead_code)]
+struct VividProcLock(std::os::fd::OwnedFd);
+
+fn lock_vivid_across_procs() -> VividProcLock {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    let path = CString::new("/tmp/ikakim_vivid_video0.lock").unwrap();
+    let fd = unsafe { open(path.as_ptr(), 0o100 | 0o2, 0o666) };
+    assert!(fd >= 0);
+    assert_eq!(unsafe { flock(fd, 2) }, 0);
+    VividProcLock(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
 const PNG_2X2_RGBA: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 6, 0,
     0, 0, 114, 182, 13, 36, 0, 0, 0, 19, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240, 31, 12,
@@ -33,6 +51,7 @@ const PNG_2X2_RGBA: &[u8] = &[
 #[test]
 fn test_v4l2_vivid_dmabuf_to_egl_and_gpu_compositor() {
     let _vivid_guard = VIVID_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _proc_lock = lock_vivid_across_procs();
     let devices = list_capture_devices();
     let vivid = devices
         .iter()
@@ -213,6 +232,7 @@ fn test_image_decode_png_and_ppm_and_swh264_roundtrip() {
 #[test]
 fn test_linux_m1_m2_full_pipeline_integration() {
     let _vivid_guard = VIVID_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _proc_lock = lock_vivid_across_procs();
     let mut clock = MasterClock::new();
     let mut mixer = AudioMixer::new(clock.clone());
     let (ch0, mut prod0) = mixer.add_channel(AudioInputConfig {

@@ -12,6 +12,7 @@ members = [
     "platforms/macos",
     "platforms/linux-common",
     "platforms/linux-vm",
+    "platforms/linux-arm64",
 ]
 
 [workspace.package]

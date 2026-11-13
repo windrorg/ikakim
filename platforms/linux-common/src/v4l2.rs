@@ -17,6 +17,7 @@ const POLLIN: i16 = 0x0001;
 
 // Linux aarch64/x86_64 共通 <linux/videodev2.h> ioctl 定数
 const VIDIOC_QUERYCAP: c_ulong = 0x8068_5600;
+const VIDIOC_ENUM_FMT: c_ulong = 0xc040_5602;
 const VIDIOC_S_FMT: c_ulong = 0xc0d0_5605;
 const VIDIOC_REQBUFS: c_ulong = 0xc014_5608;
 const VIDIOC_QUERYBUF: c_ulong = 0xc058_5609;
@@ -180,6 +181,59 @@ pub fn list_capture_devices() -> Vec<V4l2DeviceInfo> {
         }
     }
     out
+}
+
+#[repr(C)]
+struct V4l2FmtDesc {
+    index: u32,
+    buf_type: u32,
+    flags: u32,
+    description: [u8; 32],
+    pixelformat: u32,
+    mbus_code: u32,
+    reserved: [u32; 3],
+}
+
+#[derive(Debug, Clone)]
+pub struct V4l2CaptureFormat {
+    pub fourcc: u32,
+    pub fourcc_str: String,
+    pub description: String,
+}
+
+/// 指定 V4L2 キャプチャノードが対応する入力フォーマット一覧を取得する（UVC HDMI / MIPI-CSI 検証用）
+pub fn enumerate_capture_formats(device_path: &str) -> CoreResult<Vec<V4l2CaptureFormat>> {
+    let cpath = CString::new(device_path)
+        .map_err(|e| CoreError::PlatformIo(format!("invalid path: {}", e)))?;
+    let fd = unsafe { open(cpath.as_ptr(), O_RDWR | O_CLOEXEC) };
+    if fd < 0 {
+        return Err(CoreError::PlatformIo(format!(
+            "open({}) failed: {}",
+            device_path,
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut formats = Vec::new();
+    for idx in 0..64 {
+        let mut desc: V4l2FmtDesc = unsafe { std::mem::zeroed() };
+        desc.index = idx;
+        desc.buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if unsafe { ioctl(fd, VIDIOC_ENUM_FMT, &mut desc) } < 0 {
+            break;
+        }
+        let b = desc.pixelformat.to_le_bytes();
+        let fourcc_str: String = b
+            .iter()
+            .map(|&c| if c.is_ascii_graphic() || c == b' ' { c as char } else { '?' })
+            .collect();
+        formats.push(V4l2CaptureFormat {
+            fourcc: desc.pixelformat,
+            fourcc_str,
+            description: c_bytes_to_string(&desc.description),
+        });
+    }
+    unsafe { close(fd) };
+    Ok(formats)
 }
 
 fn c_bytes_to_string(buf: &[u8]) -> String {
