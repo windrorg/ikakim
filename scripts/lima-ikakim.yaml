@@ -4,8 +4,6 @@
 #   limactl shell ikakim
 
 vmType: "vz"
-rosetta:
-  enabled: false
 
 images:
   - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
@@ -16,8 +14,6 @@ memory: "8GiB"
 disk: "30GiB"
 
 mounts:
-  - location: "~"
-    writable: false
   - location: "/Users/kenichim/work/ikakim"
     writable: true
 
@@ -43,3 +39,8 @@ provision:
         "linux-modules-extra-$(uname -r)" || true
       modprobe vivid no_error_inj=1 || true
       modprobe snd-aloop enable=1,1 index=10,11 || true
+      printf "vivid\nsnd-aloop\n" > /etc/modules-load.d/live-streamer.conf
+      printf "options vivid no_error_inj=1\noptions snd-aloop enable=1,1 index=10,11\n" > /etc/modprobe.d/live-streamer.conf
+      if [ -n "${LIMA_CIDATA_USER:-}" ]; then
+        usermod -aG video,audio "${LIMA_CIDATA_USER}" || true
+      fi

@@ -56,6 +56,8 @@ options vivid no_error_inj=1
 options snd-aloop enable=1,1 index=10,11
 EOF
 
+sudo usermod -aG video,audio "$USER" || true
+
 echo "=== [4/4] Verifying virtual devices & GPU runtimes ==="
 echo "--- V4L2 Devices ---"
 v4l2-ctl --list-devices || true
