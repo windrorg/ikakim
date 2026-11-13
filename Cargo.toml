@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-types",
+    "crates/core-audio",
+    "crates/core-rtmp",
+    "crates/core-net-ui",
+    "crates/core-gpu",
+    "crates/core-engine",
+    "crates/ffi-capi",
+    "platforms/apple-common",
+    "platforms/macos",
+    "platforms/linux-common",
+    "platforms/linux-vm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+core-types = { path = "crates/core-types" }
+core-audio = { path = "crates/core-audio" }
+core-rtmp = { path = "crates/core-rtmp" }
+core-net-ui = { path = "crates/core-net-ui" }
+core-gpu = { path = "crates/core-gpu" }
+core-engine = { path = "crates/core-engine" }
+
+# 最小限の外部依存（各クレートで必要な箇所のみ利用）
+wgpu = "23.0"
+wgpu-hal = "23.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

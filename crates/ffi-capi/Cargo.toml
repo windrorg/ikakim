@@ -1,0 +1,13 @@
+[package]
+name = "ffi-capi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+core-types.workspace = true
+core-engine.workspace = true

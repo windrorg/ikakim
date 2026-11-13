@@ -1,0 +1,45 @@
+# Lima VM template for ikakim Linux V4L2 / ALSA / Mesa zero-copy verification on Apple Silicon Mac
+# Usage:
+#   limactl start --name=ikakim scripts/lima-ikakim.yaml
+#   limactl shell ikakim
+
+vmType: "vz"
+rosetta:
+  enabled: false
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 4
+memory: "8GiB"
+disk: "30GiB"
+
+mounts:
+  - location: "~"
+    writable: false
+  - location: "/Users/kenichim/work/ikakim"
+    writable: true
+
+portForwards:
+  - guestPort: 8080
+    hostPort: 8080
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y software-properties-common
+      add-apt-repository -y multiverse || true
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        build-essential pkg-config cmake clang llvm curl ca-certificates \
+        v4l-utils libv4l-dev libasound2-dev alsa-utils libfdk-aac-dev \
+        libegl1-mesa-dev libgles2-mesa-dev libvulkan-dev mesa-vulkan-drivers \
+        libgbm-dev libdrm-dev vulkan-tools mesa-utils \
+        "linux-modules-extra-$(uname -r)" || true
+      modprobe vivid no_error_inj=1 || true
+      modprobe snd-aloop enable=1,1 index=10,11 || true
