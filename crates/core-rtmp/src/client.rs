@@ -255,6 +255,7 @@ impl RtmpClient {
                         payload: win.to_be_bytes().to_vec(),
                     },
                 )?;
+                let _ = self.transport.flush();
             }
             MSG_USER_CONTROL if msg.payload.len() >= 6 => {
                 let event_type = u16::from_be_bytes([msg.payload[0], msg.payload[1]]);
@@ -273,6 +274,7 @@ impl RtmpClient {
                             payload: pong,
                         },
                     )?;
+                    let _ = self.transport.flush();
                 }
             }
             _ => {}
@@ -282,6 +284,7 @@ impl RtmpClient {
         if self.window_ack_size > 0 && rx.saturating_sub(self.last_ack_sent) >= self.window_ack_size {
             self.last_ack_sent = rx;
             self.send_ack(rx as u32)?;
+            let _ = self.transport.flush();
         }
         Ok(())
     }
@@ -331,6 +334,8 @@ impl RtmpClient {
                     if level == "error" {
                         return Err(CoreError::Network(format!("RTMP publish failed: {}", code)));
                     }
+                } else if cmd == "_error" {
+                    return Err(CoreError::Network(format!("RTMP publish _error: {:?}", vals)));
                 }
             }
         }
@@ -370,10 +375,43 @@ impl RtmpClient {
         Ok(written)
     }
 
-    /// ノンブロッキング/短タイムアウトでサーバーからの制御メッセージ（Ping/Ack等）を処理する
+    /// ノンブロッキング/短タイムアウトでサーバーからの制御メッセージ（Ping/Ack/切断通知等）を処理する
     pub fn poll_inbound(&mut self) -> CoreResult<()> {
         match self.chunk_reader.read_message(&mut self.transport) {
-            Ok(msg) => self.handle_control_message(&msg),
+            Ok(msg) => {
+                self.handle_control_message(&msg)?;
+                if msg.msg_type == MSG_COMMAND_AMF0 {
+                    if let Ok(vals) = decode_all(&msg.payload) {
+                        let cmd = vals.first().and_then(|v| v.as_str()).unwrap_or("");
+                        if cmd == "onStatus" {
+                            let info = vals.get(3);
+                            let level = info
+                                .and_then(|o| o.get("level"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let code = info
+                                .and_then(|o| o.get("code"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if level == "error"
+                                || code == "NetStream.Unpublish.Success"
+                                || code == "NetConnection.Connect.Closed"
+                            {
+                                return Err(CoreError::Network(format!(
+                                    "RTMP server closed stream: {} ({})",
+                                    code, level
+                                )));
+                            }
+                        } else if cmd == "_error" || cmd == "close" {
+                            return Err(CoreError::Network(format!(
+                                "RTMP server command {}: {:?}",
+                                cmd, vals
+                            )));
+                        }
+                    }
+                }
+                Ok(())
+            }
             Err(CoreError::Network(ref s))
                 if s.contains("TimedOut")
                     || s.contains("WouldBlock")

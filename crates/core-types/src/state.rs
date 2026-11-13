@@ -46,6 +46,8 @@ impl StateMachine {
             (Reconnecting, Idle) => true,
             (_, Error) => true,
             (Error, Idle) => true,
+            (Error, Previewing) => true,
+            (Error, Streaming) => true,
             (a, b) if a == b => true,
             _ => false,
         };

@@ -49,6 +49,7 @@ struct SharedQueue {
     closed: bool,
     video_seq_header: Option<EncodedPacket>,
     audio_seq_header: Option<EncodedPacket>,
+    stream_start_dts: Option<core_types::clock::PtsUs>,
 }
 
 /// バックグラウンド送信スレッド・AIMD ABR 監視・自動再接続バックオフを備えた RTMPS パブリッシャー
@@ -60,12 +61,14 @@ pub struct RtmpPublisher {
     packets_dropped_abr: Arc<AtomicU64>,
     reconnect_count: Arc<AtomicU64>,
     current_bitrate_bps: Arc<AtomicU64>,
+    drop_non_idr_flag: Arc<AtomicBool>,
     max_queue_bytes: usize,
     join_handle: Option<JoinHandle<()>>,
+    abr_handle: Option<JoinHandle<()>>,
 }
 
 impl RtmpPublisher {
-    pub fn spawn<F>(config: PublisherConfig, mut on_event: F) -> Self
+    pub fn spawn<F>(config: PublisherConfig, on_event: F) -> Self
     where
         F: FnMut(PublisherEvent) + Send + 'static,
     {
@@ -79,40 +82,89 @@ impl RtmpPublisher {
                 closed: false,
                 video_seq_header: None,
                 audio_seq_header: None,
+                stream_start_dts: None,
             }),
             Condvar::new(),
         ));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let is_connected = Arc::new(AtomicBool::new(false));
+        let drop_non_idr_flag = Arc::new(AtomicBool::new(false));
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let packets_sent = Arc::new(AtomicU64::new(0));
         let packets_dropped_abr = Arc::new(AtomicU64::new(0));
         let reconnect_count = Arc::new(AtomicU64::new(0));
         let current_bitrate_bps = Arc::new(AtomicU64::new(initial_bps as u64));
+        let on_event_shared = Arc::new(Mutex::new(on_event));
 
         let q_clone = Arc::clone(&queue);
         let stop_clone = Arc::clone(&stop_flag);
+        let conn_clone = Arc::clone(&is_connected);
+        let drop_flag_pub = Arc::clone(&drop_non_idr_flag);
         let bytes_clone = Arc::clone(&bytes_sent);
         let pkts_clone = Arc::clone(&packets_sent);
         let drops_clone = Arc::clone(&packets_dropped_abr);
         let reconn_clone = Arc::clone(&reconnect_count);
         let br_clone = Arc::clone(&current_bitrate_bps);
+        let on_event_pub = Arc::clone(&on_event_shared);
+
+        // ABR 評価を送信ソケット I/O から独立したスレッドで実行し、TCP 詰まり中でも即座にエンコーダ減速させる
+        let abr_cfg = config.abr.clone();
+        let q_abr = Arc::clone(&queue);
+        let stop_abr = Arc::clone(&stop_flag);
+        let conn_abr = Arc::clone(&is_connected);
+        let drop_flag_abr = Arc::clone(&drop_non_idr_flag);
+        let br_abr = Arc::clone(&current_bitrate_bps);
+        let on_event_abr = Arc::clone(&on_event_shared);
+        let abr_handle = thread::Builder::new()
+            .name("rtmp-abr-monitor".to_string())
+            .spawn(move || {
+                let mut abr = AimdAbrController::new(abr_cfg);
+                let mut last_tick = Instant::now();
+                while !stop_abr.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(50));
+                    if stop_abr.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if !conn_abr.load(Ordering::Acquire) {
+                        last_tick = Instant::now();
+                        continue;
+                    }
+                    let elapsed = last_tick.elapsed();
+                    if elapsed >= Duration::from_millis(200) {
+                        let q_bytes = { q_abr.0.lock().unwrap().queued_bytes };
+                        let decision = abr.evaluate(q_bytes, elapsed.as_millis() as u64);
+                        last_tick = Instant::now();
+                        drop_flag_abr.store(decision.drop_non_idr, Ordering::Release);
+                        br_abr.store(decision.current_bitrate_bps as u64, Ordering::Relaxed);
+                        if decision.new_bitrate_bps.is_some()
+                            || decision.drop_non_idr
+                            || decision.request_keyframe
+                        {
+                            (on_event_abr.lock().unwrap())(PublisherEvent::AbrUpdated(decision));
+                        }
+                    }
+                }
+            })
+            .expect("spawn rtmp-abr-monitor thread");
 
         let join_handle = thread::Builder::new()
             .name("rtmp-publisher".to_string())
             .spawn(move || {
-                let mut abr = AimdAbrController::new(config.abr.clone());
-                let mut backoff_ms = config.reconnect_initial_ms.max(100);
+                let initial_backoff = config.reconnect_initial_ms.max(50);
+                let mut backoff_ms = initial_backoff;
                 let mut attempts = 0u32;
                 let mut has_connected_before = false;
-                let mut last_abr_tick = Instant::now();
-                let mut drop_non_idr = false;
+                let mut in_reconnect = false;
+                let emit = move |ev: PublisherEvent| {
+                    (on_event_pub.lock().unwrap())(ev);
+                };
 
                 'outer: while !stop_clone.load(Ordering::Acquire) {
-                    on_event(PublisherEvent::StateChanged(if attempts == 0 {
-                        PipelineState::Streaming
-                    } else {
-                        PipelineState::Reconnecting
-                    }));
+                    conn_clone.store(false, Ordering::Release);
+                    let reconnecting_round = std::mem::take(&mut in_reconnect) || attempts > 0;
+                    if reconnecting_round {
+                        emit(PublisherEvent::StateChanged(PipelineState::Reconnecting));
+                    }
 
                     let mut client = match RtmpClient::connect_and_publish(
                         &config.url,
@@ -120,24 +172,31 @@ impl RtmpPublisher {
                         &config.tls,
                     ) {
                         Ok(c) => {
-                            if attempts > 0 {
+                            if reconnecting_round {
                                 reconn_clone.fetch_add(1, Ordering::Relaxed);
                             }
                             attempts = 0;
-                            backoff_ms = config.reconnect_initial_ms.max(100);
-                            on_event(PublisherEvent::StateChanged(PipelineState::Streaming));
+                            backoff_ms = initial_backoff;
+                            conn_clone.store(true, Ordering::Release);
+                            emit(PublisherEvent::StateChanged(PipelineState::Streaming));
                             c
                         }
                         Err(e) => {
                             attempts += 1;
-                            on_event(PublisherEvent::Error(e.to_string()));
+                            emit(PublisherEvent::Error(e.to_string()));
                             if let Some(max) = config.max_reconnect_attempts {
                                 if attempts >= max {
-                                    on_event(PublisherEvent::StateChanged(PipelineState::Error));
+                                    {
+                                        let (lock, cvar) = &*q_clone;
+                                        let mut guard = lock.lock().unwrap();
+                                        guard.closed = true;
+                                        cvar.notify_all();
+                                    }
+                                    emit(PublisherEvent::StateChanged(PipelineState::Error));
                                     break 'outer;
                                 }
                             }
-                            on_event(PublisherEvent::StateChanged(PipelineState::Reconnecting));
+                            emit(PublisherEvent::StateChanged(PipelineState::Reconnecting));
                             let sleep_step = Duration::from_millis(50);
                             let mut waited = 0u64;
                             while waited < backoff_ms && !stop_clone.load(Ordering::Acquire) {
@@ -149,48 +208,62 @@ impl RtmpPublisher {
                         }
                     };
 
-                    // 再接続時はキャッシュ済みのシーケンスヘッダ（SPS/PPS・AAC AudioSpecificConfig）を先頭に再送
+                    // 再接続時はキャッシュ済みのシーケンスヘッダ（SPS/PPS・AAC AudioSpecificConfig）を先頭に再送し、
+                    // 上流エンコーダへ IDR キーフレーム再送を要求する
+                    let mut waiting_for_keyframe = true;
                     if has_connected_before {
                         let (v_seq, a_seq) = {
                             let guard = q_clone.0.lock().unwrap();
                             (guard.video_seq_header.clone(), guard.audio_seq_header.clone())
                         };
                         if let Some(pkt) = v_seq {
-                            if let Ok(n) = client.send_packet(&pkt) {
-                                bytes_clone.fetch_add(n as u64, Ordering::Relaxed);
-                                pkts_clone.fetch_add(1, Ordering::Relaxed);
+                            match client.send_packet(&pkt) {
+                                Ok(n) => {
+                                    bytes_clone.fetch_add(n as u64, Ordering::Relaxed);
+                                    pkts_clone.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    in_reconnect = true;
+                                    emit(PublisherEvent::Error(format!(
+                                        "RTMP reconnect seq header failed: {}",
+                                        e
+                                    )));
+                                    continue 'outer;
+                                }
                             }
                         }
                         if let Some(pkt) = a_seq {
-                            if let Ok(n) = client.send_packet(&pkt) {
-                                bytes_clone.fetch_add(n as u64, Ordering::Relaxed);
-                                pkts_clone.fetch_add(1, Ordering::Relaxed);
+                            match client.send_packet(&pkt) {
+                                Ok(n) => {
+                                    bytes_clone.fetch_add(n as u64, Ordering::Relaxed);
+                                    pkts_clone.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    in_reconnect = true;
+                                    emit(PublisherEvent::Error(format!(
+                                        "RTMP reconnect audio seq failed: {}",
+                                        e
+                                    )));
+                                    continue 'outer;
+                                }
                             }
                         }
+                        emit(PublisherEvent::AbrUpdated(crate::abr::AbrDecision {
+                            current_bitrate_bps: br_clone.load(Ordering::Relaxed) as u32,
+                            new_bitrate_bps: None,
+                            drop_non_idr: false,
+                            request_keyframe: true,
+                            dwell_ms: 0,
+                        }));
                     }
                     has_connected_before = true;
 
                     // メディア送信ループ
+                    let mut last_inbound_poll = Instant::now();
                     loop {
                         if stop_clone.load(Ordering::Acquire) {
                             client.close();
                             break 'outer;
-                        }
-
-                        // 200ms 周期で AIMD ABR 評価
-                        let elapsed = last_abr_tick.elapsed();
-                        if elapsed >= Duration::from_millis(200) {
-                            let q_bytes = { q_clone.0.lock().unwrap().queued_bytes };
-                            let decision = abr.evaluate(q_bytes, elapsed.as_millis() as u64);
-                            last_abr_tick = Instant::now();
-                            drop_non_idr = decision.drop_non_idr;
-                            br_clone.store(decision.current_bitrate_bps as u64, Ordering::Relaxed);
-                            if decision.new_bitrate_bps.is_some()
-                                || decision.drop_non_idr
-                                || decision.request_keyframe
-                            {
-                                on_event(PublisherEvent::AbrUpdated(decision));
-                            }
                         }
 
                         let pkt_opt = {
@@ -213,9 +286,22 @@ impl RtmpPublisher {
                             }
                         };
 
+                        let queue_was_idle = pkt_opt.is_none();
                         if let Some(pkt) = pkt_opt {
+                            if waiting_for_keyframe
+                                && pkt.codec == CodecKind::H264
+                                && !pkt.is_sequence_header
+                            {
+                                if pkt.is_keyframe {
+                                    waiting_for_keyframe = false;
+                                } else {
+                                    drops_clone.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                            }
+
                             // 滞留 > 1000ms の緊急時は非IDR映像フレームを破棄し音声とリアルタイム性を保護
-                            if drop_non_idr
+                            if drop_flag_pub.load(Ordering::Acquire)
                                 && pkt.codec == CodecKind::H264
                                 && !pkt.is_keyframe
                                 && !pkt.is_sequence_header
@@ -230,18 +316,46 @@ impl RtmpPublisher {
                                     pkts_clone.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Err(e) => {
-                                    on_event(PublisherEvent::Error(format!(
+                                    in_reconnect = true;
+                                    conn_clone.store(false, Ordering::Release);
+                                    emit(PublisherEvent::StateChanged(PipelineState::Reconnecting));
+                                    emit(PublisherEvent::Error(format!(
                                         "RTMP send failed, reconnecting: {}",
                                         e
                                     )));
+                                    let sleep_step = Duration::from_millis(50);
+                                    let mut waited = 0u64;
+                                    while waited < backoff_ms && !stop_clone.load(Ordering::Acquire) {
+                                        thread::sleep(sleep_step);
+                                        waited += 50;
+                                    }
                                     break;
                                 }
                             }
                         }
 
-                        let _ = client.poll_inbound();
+                        if queue_was_idle || last_inbound_poll.elapsed() >= Duration::from_millis(25) {
+                            last_inbound_poll = Instant::now();
+                            if let Err(e) = client.poll_inbound() {
+                                in_reconnect = true;
+                                conn_clone.store(false, Ordering::Release);
+                                emit(PublisherEvent::StateChanged(PipelineState::Reconnecting));
+                                emit(PublisherEvent::Error(format!(
+                                    "RTMP connection closed/error from peer, reconnecting: {}",
+                                    e
+                                )));
+                                let sleep_step = Duration::from_millis(50);
+                                let mut waited = 0u64;
+                                while waited < backoff_ms && !stop_clone.load(Ordering::Acquire) {
+                                    thread::sleep(sleep_step);
+                                    waited += 50;
+                                }
+                                break;
+                            }
+                        }
                     }
                 }
+                conn_clone.store(false, Ordering::Release);
             })
             .expect("spawn rtmp-publisher thread");
 
@@ -253,13 +367,15 @@ impl RtmpPublisher {
             packets_dropped_abr,
             reconnect_count,
             current_bitrate_bps,
+            drop_non_idr_flag,
             max_queue_bytes,
             join_handle: Some(join_handle),
+            abr_handle: Some(abr_handle),
         }
     }
 
-    /// エンコード済みパケットを送信キューへ積む。キュー上限超過時は古い非キーフレームを破棄または `BufferFull` を返す。
-    pub fn enqueue(&self, packet: EncodedPacket) -> CoreResult<()> {
+    /// エンコード済みパケットを送信キューへ積む。緊急ABRドロップ中やキュー上限超過時は非キーフレームを破棄または `BufferFull` を返す。
+    pub fn enqueue(&self, mut packet: EncodedPacket) -> CoreResult<()> {
         let (lock, cvar) = &*self.queue;
         let mut guard = lock.lock().unwrap();
         if guard.closed {
@@ -267,14 +383,21 @@ impl RtmpPublisher {
         }
 
         if packet.is_sequence_header {
+            packet.pts = core_types::clock::PtsUs(0);
+            packet.dts = core_types::clock::PtsUs(0);
             match packet.codec {
                 CodecKind::H264 => guard.video_seq_header = Some(packet.clone()),
                 CodecKind::AacLc => guard.audio_seq_header = Some(packet.clone()),
                 _ => {}
             }
+        } else {
+            let base = *guard.stream_start_dts.get_or_insert(packet.dts);
+            packet.pts = core_types::clock::PtsUs(packet.pts.0.saturating_sub(base.0));
+            packet.dts = core_types::clock::PtsUs(packet.dts.0.saturating_sub(base.0));
         }
 
-        if guard.queued_bytes + packet.data.len() > self.max_queue_bytes
+        if (self.drop_non_idr_flag.load(Ordering::Acquire)
+            || guard.queued_bytes + packet.data.len() > self.max_queue_bytes)
             && !packet.is_sequence_header
             && packet.codec == CodecKind::H264
             && !packet.is_keyframe
@@ -308,6 +431,9 @@ impl RtmpPublisher {
             let mut guard = lock.lock().unwrap();
             guard.closed = true;
             cvar.notify_all();
+        }
+        if let Some(h) = self.abr_handle.take() {
+            let _ = h.join();
         }
         if let Some(h) = self.join_handle.take() {
             let _ = h.join();
