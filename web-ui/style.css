@@ -1,0 +1,148 @@
+:root {
+  --bg: #0e1116;
+  --panel: #161b22;
+  --border: #2a313c;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #2f81f7;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --danger: #f85149;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.brand { display: flex; align-items: center; gap: 10px; font-size: 1.05rem; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); }
+.dot.connected { background: var(--ok); }
+.badge {
+  font-size: 0.78rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #21262d;
+  border: 1px solid var(--border);
+}
+.telemetry { display: flex; gap: 18px; font-size: 0.85rem; color: var(--muted); }
+.telemetry strong { color: var(--text); }
+
+.grid {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  gap: 16px;
+  padding: 16px;
+  max-width: 1440px;
+  margin: 0 auto;
+}
+@media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+}
+.overlay-panel { grid-column: 1 / -1; }
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.panel-header h2 { margin: 0; font-size: 0.95rem; font-weight: 600; }
+.codec-label { font-size: 0.75rem; color: var(--muted); font-family: monospace; }
+
+.video-wrap {
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+video { width: 100%; height: 100%; object-fit: contain; }
+
+.stream-bar { display: flex; gap: 8px; margin-top: 12px; }
+.stream-bar input {
+  flex: 1;
+  background: #0d1117;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+button.primary {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-weight: 600;
+  cursor: pointer;
+}
+button.primary.live { background: var(--danger); }
+
+.master-meter, .channel-card {
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 10px;
+}
+.meter-title { font-size: 0.75rem; font-weight: 700; color: var(--muted); margin-bottom: 6px; }
+.bar-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 0.78rem; }
+.track {
+  flex: 1;
+  height: 10px;
+  background: #1f242c;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--ok) 0%, var(--warn) 78%, var(--danger) 95%);
+  transition: width 40ms linear;
+}
+.db { width: 46px; text-align: right; font-family: monospace; color: var(--muted); }
+
+.ch-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.ch-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.8rem; margin-top: 6px; }
+.ch-controls label { display: flex; flex-direction: column; gap: 2px; color: var(--muted); }
+.mute-btn {
+  padding: 3px 10px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: #21262d;
+  color: var(--text);
+  cursor: pointer;
+}
+.mute-btn.muted { background: var(--danger); border-color: var(--danger); }
+
+.overlay-controls .field-row { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
+.overlay-controls select {
+  background: #0d1117;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+.sliders { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.sliders label { display: flex; flex-direction: column; gap: 4px; font-size: 0.82rem; color: var(--muted); }

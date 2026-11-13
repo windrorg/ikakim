@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ikakim Studio — Control &amp; Low-Latency Preview</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="ws-dot"></span>
+      <strong>ikakim</strong>
+      <span class="badge" id="state-badge">Idle</span>
+    </div>
+    <div class="telemetry">
+      <span>FPS: <strong id="fps-readout">0.0</strong></span>
+      <span>Bitrate: <strong id="bitrate-readout">0 kbps</strong></span>
+      <span>Preview Latency: <strong id="latency-readout">-- ms</strong></span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="panel preview-panel">
+      <div class="panel-header">
+        <h2>MSE Low-Latency Preview (&le; 300ms Catch-up)</h2>
+        <span class="codec-label" id="codec-label">waiting for init segment...</span>
+      </div>
+      <div class="video-wrap">
+        <video id="preview-video" autoplay muted playsinline></video>
+      </div>
+      <div class="stream-bar">
+        <input id="rtmp-url" type="text" placeholder="rtmps://a.rtmps.youtube.com/live2/xxxx-yyyy" />
+        <button id="btn-stream-toggle" class="primary">Start Stream</button>
+      </div>
+    </section>
+
+    <section class="panel mixer-panel">
+      <div class="panel-header">
+        <h2>48kHz Audio Mixer &amp; Peak Meters (30Hz)</h2>
+      </div>
+      <div class="master-meter">
+        <div class="meter-title">MASTER OUT</div>
+        <div class="meter-bars">
+          <div class="bar-row"><span>L</span><div class="track"><div id="master-l-bar" class="fill"></div></div><span id="master-l-db" class="db">-96.0</span></div>
+          <div class="bar-row"><span>R</span><div class="track"><div id="master-r-bar" class="fill"></div></div><span id="master-r-db" class="db">-96.0</span></div>
+        </div>
+      </div>
+      <div id="channels-container" class="channels"></div>
+    </section>
+
+    <section class="panel overlay-panel">
+      <div class="panel-header">
+        <h2>GPU Overlay Transform</h2>
+      </div>
+      <div id="overlay-controls" class="overlay-controls">
+        <div class="field-row">
+          <label for="layer-select">Layer</label>
+          <select id="layer-select">
+            <option value="1">Layer 1: Overlay Video (Alpha)</option>
+            <option value="0">Layer 0: Main Camera</option>
+          </select>
+          <label class="inline-check"><input type="checkbox" id="layer-visible" checked /> Visible</label>
+        </div>
+        <div class="sliders">
+          <label>Pos X <input type="range" id="layer-x" min="-1" max="1" step="0.02" value="0" /> <span id="layer-x-val">0.00</span></label>
+          <label>Pos Y <input type="range" id="layer-y" min="-1" max="1" step="0.02" value="0" /> <span id="layer-y-val">0.00</span></label>
+          <label>Scale <input type="range" id="layer-scale" min="0.1" max="1.5" step="0.02" value="0.5" /> <span id="layer-scale-val">0.50</span></label>
+          <label>Opacity <input type="range" id="layer-opacity" min="0" max="1" step="0.02" value="1" /> <span id="layer-opacity-val">1.00</span></label>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
