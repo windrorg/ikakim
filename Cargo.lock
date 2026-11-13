@@ -17,7 +17,13 @@ version = "0.1.0"
 dependencies = [
  "core-audio",
  "core-engine",
+ "core-gpu",
+ "core-net-ui",
+ "core-rtmp",
  "core-types",
+ "metal",
+ "wgpu",
+ "wgpu-hal",
 ]
 
 [[package]]
@@ -472,9 +478,15 @@ dependencies = [
 name = "linux-common"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "core-audio",
  "core-engine",
+ "core-gpu",
+ "core-net-ui",
+ "core-rtmp",
  "core-types",
+ "wgpu",
+ "wgpu-hal",
 ]
 
 [[package]]
@@ -612,7 +624,11 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "platform-linux-vm"
 version = "0.1.0"
 dependencies = [
+ "core-audio",
  "core-engine",
+ "core-gpu",
+ "core-net-ui",
+ "core-rtmp",
  "core-types",
  "linux-common",
 ]
@@ -622,7 +638,11 @@ name = "platform-macos"
 version = "0.1.0"
 dependencies = [
  "apple-common",
+ "core-audio",
  "core-engine",
+ "core-gpu",
+ "core-net-ui",
+ "core-rtmp",
  "core-types",
 ]
 
