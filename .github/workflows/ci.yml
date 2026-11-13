@@ -27,8 +27,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Verify C99 FFI header
         run: clang -fsyntax-only -Wall -Wextra -std=c99 crates/ffi-capi/include/ikakim_ffi.h
-      - name: Run workspace tests
-        run: cargo test --workspace
+      - name: Run workspace tests (excluding Lima vivid kernel-module tests)
+        run: |
+          cargo test --workspace --exclude linux-common
+          cargo test -p linux-common --test linux_audio_test
+          cargo test -p linux-common --test linux_m3_hw_test
+          cargo test -p linux-common --test linux_video_test test_image_decode_png_and_ppm_and_swh264_roundtrip
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -44,8 +48,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Verify C99 FFI header
         run: clang -fsyntax-only -Wall -Wextra -std=c99 crates/ffi-capi/include/ikakim_ffi.h
-      - name: Run workspace tests
-        run: cargo test --workspace
+      - name: Run workspace tests (excluding Lima vivid kernel-module tests)
+        run: |
+          cargo test --workspace --exclude linux-common
+          cargo test -p linux-common --test linux_audio_test
+          cargo test -p linux-common --test linux_m3_hw_test
+          cargo test -p linux-common --test linux_video_test test_image_decode_png_and_ppm_and_swh264_roundtrip
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Cross-build ffi-capi for iOS device & simulator
