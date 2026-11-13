@@ -182,18 +182,20 @@ mod android_exports {
         android_format: JInt,
         usage_flags: JLong,
     ) -> JInt {
-        portable_submit_ahb_meta(
-            unsafe { jlong_to_handle(handle) },
-            layer_id.max(0) as u32,
-            is_base_layer != 0,
-            AhbDescriptor {
-                buffer_id: buffer_id.max(0) as u64,
-                width: width.max(0) as u32,
-                height: height.max(0) as u32,
-                android_format: android_format.max(0) as u32,
-                usage_flags: usage_flags.max(0) as u64,
-            },
-        )
+        unsafe {
+            portable_submit_ahb_meta(
+                jlong_to_handle(handle),
+                layer_id.max(0) as u32,
+                is_base_layer != 0,
+                AhbDescriptor {
+                    buffer_id: buffer_id.max(0) as u64,
+                    width: width.max(0) as u32,
+                    height: height.max(0) as u32,
+                    android_format: android_format.max(0) as u32,
+                    usage_flags: usage_flags.max(0) as u64,
+                },
+            )
+        }
     }
 
     #[no_mangle]
