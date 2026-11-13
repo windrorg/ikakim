@@ -55,7 +55,8 @@ cargo run -p platform-linux-arm64 --release -- --soak --frames 150
 
 ### 4. Android 実機向けビルド手順（Android NDK / Gradle 環境が必要）
 ```bash
-# Android NDK 上で Rust JNI 共有ライブラリ (libffi_capi.so) をビルド
-cargo ndk -t arm64-v8a -o platforms/android/app/src/main/jniLibs build --release -p ffi-capi
+# Android NDK 上で Rust JNI 共有ライブラリ (libffi_capi.so) をビルドし jniLibs/arm64-v8a へ配置
+./scripts/build-android-jni.sh --release
 # 続いて Android Studio または platforms/android で Gradle ビルドを実行
+cd platforms/android && gradle assembleDebug
 ```

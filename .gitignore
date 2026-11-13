@@ -1,5 +1,8 @@
 /target
 /build
+/platforms/android/.gradle
+/platforms/android/app/build
+/platforms/android/app/src/main/jniLibs
 **/*.rs.bk
 .DS_Store
 *.swp

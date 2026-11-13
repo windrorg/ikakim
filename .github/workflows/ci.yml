@@ -60,3 +60,25 @@ jobs:
         run: |
           xcrun --sdk iphoneos swiftc -typecheck -target arm64-apple-ios16.0 -I platforms/ios platforms/ios/*.swift
           xcrun --sdk iphonesimulator swiftc -typecheck -target arm64-apple-ios16.0-simulator -I platforms/ios platforms/ios/*.swift
+
+  android:
+    name: Android NDK (arm64-v8a) & Kotlin APK Build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Build libffi_capi.so for arm64-v8a via Android NDK
+        run: ./scripts/build-android-jni.sh --release
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - name: Assemble Android debug APK
+        working-directory: platforms/android
+        run: gradle assembleDebug --no-daemon
