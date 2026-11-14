@@ -191,12 +191,16 @@ unsafe extern "C" fn converter_input_proc(
     let provide_frames = requested_frames;
     let sample_count = provide_frames * AUDIO_CHANNELS;
     state.staged.clear();
-    state.staged.reserve(sample_count);
-    for _ in 0..sample_count {
-        if let Some(s) = state.pcm.pop_front() {
-            state.staged.push(s);
-        }
+    let (front, back) = state.pcm.as_slices();
+    if front.len() >= sample_count {
+        state.staged.extend_from_slice(&front[..sample_count]);
+    } else {
+        state.staged.extend_from_slice(front);
+        state
+            .staged
+            .extend_from_slice(&back[..sample_count - front.len()]);
     }
+    state.pcm.drain(..sample_count);
 
     *io_number_data_packets = provide_frames as u32;
     (*io_data).m_buffers[0].m_number_channels = AUDIO_CHANNELS as u32;

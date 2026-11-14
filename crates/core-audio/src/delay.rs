@@ -15,6 +15,8 @@ pub struct StereoDelayLine {
     prev_delay_frames: usize,
     crossfade_pos: usize,
     crossfade_len: usize,
+    /// 連続して無音（0.0）が書き込まれたフレーム数（バッファ全体が無音ならメモリ書き込みをスキップ可能）
+    silent_frames: usize,
 }
 
 const FRAMES_PER_MS: usize = (MASTER_SAMPLE_RATE / 1000) as usize; // 48
@@ -37,6 +39,7 @@ impl StereoDelayLine {
             prev_delay_frames: clamped_frames,
             crossfade_pos: CROSSFADE_FRAMES,
             crossfade_len: CROSSFADE_FRAMES,
+            silent_frames: capacity_frames,
         }
     }
 
@@ -46,6 +49,7 @@ impl StereoDelayLine {
     }
 
     /// 遅延量をミリ秒単位（0..=1000ms）で更新する
+    #[inline]
     pub fn set_delay_ms(&mut self, delay_ms: u32) {
         let next_frames = Self::ms_to_frames(delay_ms);
         if next_frames != self.target_delay_frames {
@@ -60,6 +64,12 @@ impl StereoDelayLine {
         (self.target_delay_frames / FRAMES_PER_MS) as u32
     }
 
+    /// ディレイライン内部の過去サンプルがすべて無音（0.0）に収束しているかどうかを返す
+    #[inline]
+    pub fn is_settled_silent(&self) -> bool {
+        self.silent_frames >= self.capacity_frames
+    }
+
     #[inline]
     fn read_delayed(&self, delay_frames: usize) -> (f32, f32) {
         let read_idx = self.write_pos.wrapping_sub(delay_frames) & self.mask;
@@ -67,19 +77,63 @@ impl StereoDelayLine {
         (self.buffer[base], self.buffer[base + 1])
     }
 
+    /// 出力変更を伴わない `delay == 0` 時に、リングバッファへ一括 `memcpy` で履歴のみを記録する
+    #[inline]
+    fn write_history_bulk(&mut self, interleaved_pcm: &[f32]) {
+        let total_frames = interleaved_pcm.len() / 2;
+        if total_frames == 0 {
+            return;
+        }
+        // 容量を超える一括入力があった場合は末尾 `capacity_frames` 分のみ履歴に残せば十分
+        if total_frames > self.capacity_frames {
+            let skip_frames = total_frames - self.capacity_frames;
+            self.write_pos = (self.write_pos + skip_frames) & self.mask;
+            self.write_history_bulk(&interleaved_pcm[skip_frames * 2..]);
+            return;
+        }
+
+        let first_frames = (self.capacity_frames - self.write_pos).min(total_frames);
+        let dst_start = self.write_pos * 2;
+        let first_samples = first_frames * 2;
+        self.buffer[dst_start..dst_start + first_samples]
+            .copy_from_slice(&interleaved_pcm[..first_samples]);
+
+        if first_frames < total_frames {
+            let rem_samples = (total_frames - first_frames) * 2;
+            self.buffer[..rem_samples]
+                .copy_from_slice(&interleaved_pcm[first_samples..first_samples + rem_samples]);
+        }
+        self.write_pos = (self.write_pos + total_frames) & self.mask;
+    }
+
+    /// 入力が完全に無音（`0.0`）であることが既知のブロックを高速処理する。
+    /// すでにディレイライン全体が無音化している場合は 512KB バッファへの書き込み自体をスキップし、
+    /// L2 キャッシュ汚染を防止する。戻り値が `true` の場合、出力 `interleaved_pcm` も完全無音のまま確定する。
+    pub fn process_known_silent_in_place(&mut self, interleaved_pcm: &mut [f32]) -> bool {
+        let frames = interleaved_pcm.len() / 2;
+        if self.is_settled_silent() {
+            if self.crossfade_pos < self.crossfade_len {
+                self.crossfade_pos = (self.crossfade_pos + frames).min(self.crossfade_len);
+                if self.crossfade_pos >= self.crossfade_len {
+                    self.current_delay_frames = self.target_delay_frames;
+                }
+            }
+            return true;
+        }
+        self.process_in_place(interleaved_pcm);
+        self.silent_frames = self.silent_frames.saturating_add(frames);
+        false
+    }
+
     /// インターリーブステレオPCMスライス `[L, R, L, R, ...]` をインプレースで遅延処理する
     pub fn process_in_place(&mut self, interleaved_pcm: &mut [f32]) {
         debug_assert_eq!(interleaved_pcm.len() % 2, 0);
+        self.silent_frames = 0;
 
         if self.crossfade_pos >= self.crossfade_len {
             let delay = self.current_delay_frames;
             if delay == 0 {
-                for frame in interleaved_pcm.chunks_exact(2) {
-                    let w_base = self.write_pos * 2;
-                    self.buffer[w_base] = frame[0];
-                    self.buffer[w_base + 1] = frame[1];
-                    self.write_pos = (self.write_pos + 1) & self.mask;
-                }
+                self.write_history_bulk(interleaved_pcm);
             } else {
                 for frame in interleaved_pcm.chunks_exact_mut(2) {
                     let w_base = self.write_pos * 2;
@@ -123,6 +177,6 @@ impl StereoDelayLine {
     pub fn clear(&mut self) {
         self.buffer.fill(0.0);
         self.write_pos = 0;
-        let _ = self.capacity_frames;
+        self.silent_frames = self.capacity_frames;
     }
 }

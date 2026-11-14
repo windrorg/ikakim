@@ -286,39 +286,54 @@ impl VirtualAudioSource {
         Self::mix_blocks_for_fps_frame(60, frame_idx)
     }
 
-    /// `frames` サンプル分のインターリーブ・ステレオ f32 PCM（要素数 = `frames * 2`）を位相連続で生成
-    pub fn next_stereo_f32(&mut self, frames: usize) -> Vec<f32> {
-        let mut out = Vec::with_capacity(frames * 2);
+    /// 呼び出し元が用意したインターリーブ・ステレオバッファ `out`（`out.len() / 2` フレーム）へ
+    /// ヒープアロケーションなしで位相連続のテスト信号を生成する
+    pub fn fill_stereo_f32(&mut self, out: &mut [f32]) {
         let sr = self.sample_rate as f32;
         match self.signal {
             VirtualAudioSignal::Silence => {
-                out.resize(frames * 2, 0.0);
+                out.fill(0.0);
             }
             VirtualAudioSignal::SineTone { freq_hz, amplitude } => {
-                let inc = TAU * freq_hz / sr;
-                for _ in 0..frames {
+                let inc = (TAU * freq_hz / sr).rem_euclid(TAU);
+                for frame in out.chunks_exact_mut(2) {
                     let s = self.phase_l.sin() * amplitude;
-                    self.phase_l = (self.phase_l + inc) % TAU;
-                    self.phase_r = self.phase_l;
-                    out.push(s);
-                    out.push(s);
+                    self.phase_l += inc;
+                    if self.phase_l >= TAU {
+                        self.phase_l -= TAU;
+                    }
+                    frame[0] = s;
+                    frame[1] = s;
                 }
+                self.phase_r = self.phase_l;
             }
             VirtualAudioSignal::DualChannelTone {
                 left_freq_hz,
                 right_freq_hz,
                 amplitude,
             } => {
-                let inc_l = TAU * left_freq_hz / sr;
-                let inc_r = TAU * right_freq_hz / sr;
-                for _ in 0..frames {
-                    out.push(self.phase_l.sin() * amplitude);
-                    out.push(self.phase_r.sin() * amplitude);
-                    self.phase_l = (self.phase_l + inc_l) % TAU;
-                    self.phase_r = (self.phase_r + inc_r) % TAU;
+                let inc_l = (TAU * left_freq_hz / sr).rem_euclid(TAU);
+                let inc_r = (TAU * right_freq_hz / sr).rem_euclid(TAU);
+                for frame in out.chunks_exact_mut(2) {
+                    frame[0] = self.phase_l.sin() * amplitude;
+                    frame[1] = self.phase_r.sin() * amplitude;
+                    self.phase_l += inc_l;
+                    if self.phase_l >= TAU {
+                        self.phase_l -= TAU;
+                    }
+                    self.phase_r += inc_r;
+                    if self.phase_r >= TAU {
+                        self.phase_r -= TAU;
+                    }
                 }
             }
         }
+    }
+
+    /// `frames` サンプル分のインターリーブ・ステレオ f32 PCM（要素数 = `frames * 2`）を位相連続で生成
+    pub fn next_stereo_f32(&mut self, frames: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; frames * 2];
+        self.fill_stereo_f32(&mut out);
         out
     }
 }

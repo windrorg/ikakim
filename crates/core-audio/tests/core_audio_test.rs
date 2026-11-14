@@ -313,3 +313,171 @@ fn test_property_resampler_arbitrary_rates_and_chunk_sizes() {
         }
     }
 }
+
+#[test]
+fn test_resampler_48khz_mono_upmix_fast_path_exact_identity() {
+    use core_audio::resampler::PolyphaseResampler;
+
+    let mut resampler = PolyphaseResampler::new(48_000, 1);
+    assert!(!resampler.is_passthrough());
+    assert!(resampler.is_mono_upmix_only());
+
+    let mono_in: Vec<f32> = (0..480).map(|i| ((i as f32) * 0.01).sin()).collect();
+    let mut stereo_out = Vec::new();
+    let written = resampler.process(&mono_in, &mut stereo_out);
+    assert_eq!(written, mono_in.len() * 2);
+    for (i, &m) in mono_in.iter().enumerate() {
+        assert_eq!(stereo_out[i * 2], m);
+        assert_eq!(stereo_out[i * 2 + 1], m);
+    }
+}
+
+#[test]
+fn test_mixer_click_free_gain_and_mute_dezippering_ramp() {
+    let clock = MasterClock::new();
+    let mut mixer = AudioMixer::new(clock);
+
+    let (ch, mut prod) = mixer.add_channel(AudioInputConfig {
+        name: "ramp-test".to_string(),
+        sample_rate: 48_000,
+        channels: 2,
+        initial_gain: 0.8,
+        initial_muted: false,
+        initial_delay_ms: 0,
+    });
+
+    let dc_block = vec![0.5f32; MIX_BLOCK_FRAMES * 2];
+    let mut out = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
+
+    // Block 0: 定常状態 (0.5 * 0.8 = 0.4)
+    prod.push_f32(&dc_block);
+    mixer.mix_block(&mut out);
+    for &s in &out {
+        assert!((s - 0.4).abs() < 1e-6);
+    }
+
+    // Block 1: ミュート ON -> 0.4 から 0.0 へ 480 フレームかけて滑らかに線形減衰し、ステップ不連続が無いこと
+    ch.set_muted(true);
+    prod.push_f32(&dc_block);
+    let mut prev = 0.4f32;
+    let expected_step = 0.4 / (MIX_BLOCK_FRAMES as f32);
+    mixer.mix_block(&mut out);
+    for frame in out.chunks_exact(2) {
+        let l = frame[0];
+        assert!((l - frame[1]).abs() < 1e-6);
+        let diff = prev - l;
+        assert!(
+            (diff - expected_step).abs() < 1e-5,
+            "step discontinuity detected on mute ramp: prev={prev}, cur={l}, diff={diff}, expected={expected_step}"
+        );
+        prev = l;
+    }
+    assert!(out[out.len() - 1].abs() < 1e-6);
+
+    // Block 2: ミュート定常状態 -> 完全 0.0
+    prod.push_f32(&dc_block);
+    mixer.mix_block(&mut out);
+    assert!(out.iter().all(|&s| s == 0.0));
+
+    // Block 3: ミュート解除 & ゲイン変更 (1.2 -> 出力 0.5 * 1.2 = 0.6) -> 0.0 から 0.6 へ線形ランプ
+    ch.set_gain_linear(1.2);
+    ch.set_muted(false);
+    prod.push_f32(&dc_block);
+    mixer.mix_block(&mut out);
+    let mut prev_unmute = 0.0f32;
+    let expected_up_step = 0.6 / (MIX_BLOCK_FRAMES as f32);
+    for frame in out.chunks_exact(2) {
+        let l = frame[0];
+        let diff = l - prev_unmute;
+        assert!(
+            (diff - expected_up_step).abs() < 1e-5,
+            "step discontinuity on unmute ramp: diff={diff}, expected={expected_up_step}"
+        );
+        prev_unmute = l;
+    }
+    assert!((out[out.len() - 1] - 0.6).abs() < 1e-5);
+}
+
+#[test]
+fn test_settled_silent_delay_fast_path_and_wake_recovery() {
+    use core_audio::delay::StereoDelayLine;
+
+    let mut delay = StereoDelayLine::new(10); // 10ms = 480 frames
+    assert!(delay.is_settled_silent());
+
+    let mut buf = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
+    // 初期状態で無音入力なら即座に fast path (true) が返ること
+    assert!(delay.process_known_silent_in_place(&mut buf));
+
+    // インパルスを1発入れると settled_silent が解除されること
+    buf[0] = 0.9;
+    buf[1] = -0.9;
+    delay.process_in_place(&mut buf);
+    assert!(!delay.is_settled_silent());
+    // 10ms ディレイなのでこのブロックの出力はまだ 0.0
+    assert!(buf.iter().all(|&s| s == 0.0));
+
+    // 次のブロックは無音入力だが、10ms 前のインパルスが出力されるため fast path には入らない (false)
+    let mut next_buf = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
+    assert!(!delay.process_known_silent_in_place(&mut next_buf));
+    assert!((next_buf[0] - 0.9).abs() < 1e-6);
+    assert!((next_buf[1] - (-0.9)).abs() < 1e-6);
+}
+
+#[test]
+fn test_atomic_peak_stereo_fetch_max_and_db_conversions() {
+    use core_audio::meter::{linear_to_db, AtomicPeakStereo};
+
+    let peak = AtomicPeakStereo::new();
+    // NaN や負のゼロ、微小値を混ぜても最大振幅が正確に保持されること
+    peak.observe(f32::NAN, -0.0);
+    peak.observe(0.25, 0.75);
+    peak.observe(0.5, 0.1);
+    peak.observe(0.125, 0.6);
+
+    let (l_db, r_db) = peak.take_dbfs();
+    assert!((l_db - amplitude_to_dbfs(0.5)).abs() < 1e-4);
+    assert!((r_db - amplitude_to_dbfs(0.75)).abs() < 1e-4);
+
+    // dB <-> Linear 往復変換の整合性
+    for &db in &[-60.0f32, -24.0, -12.0, -6.0, 0.0, 6.0, 12.0] {
+        let lin = db_to_linear(db);
+        let roundtrip_db = linear_to_db(lin);
+        assert!(
+            (roundtrip_db - db).abs() < 1e-3,
+            "db={db} -> lin={lin} -> roundtrip={roundtrip_db}"
+        );
+    }
+    assert_eq!(db_to_linear(-96.0), 0.0);
+    assert_eq!(linear_to_db(0.0), DBFS_FLOOR);
+}
+
+#[test]
+fn test_push_i16_and_i32_normalization_accuracy() {
+    let clock = MasterClock::new();
+    let mut mixer = AudioMixer::new(clock);
+    let (_ch, mut prod) = mixer.add_channel(AudioInputConfig::default());
+
+    let mut samples_i16 = vec![0i16; MIX_BLOCK_FRAMES * 2];
+    samples_i16[0] = -16384; // -0.5 (linear region)
+    samples_i16[1] = 16384; // +0.5 (linear region)
+    samples_i16[2] = i16::MIN; // -1.0 -> master soft_clip(-1.0)
+    assert_eq!(prod.push_i16(&samples_i16), MIX_BLOCK_FRAMES * 2);
+
+    let mut out = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
+    mixer.mix_block(&mut out);
+    assert!((out[0] - (-0.5)).abs() < 1e-5);
+    assert!((out[1] - 0.5).abs() < 1e-5);
+    assert!((out[2] - soft_clip(-1.0)).abs() < 1e-5);
+
+    let mut samples_i32 = vec![0i32; MIX_BLOCK_FRAMES * 2];
+    samples_i32[0] = -1_073_741_824; // -0.5 (linear region)
+    samples_i32[1] = 1_073_741_824; // +0.5 (linear region)
+    samples_i32[2] = i32::MIN; // -1.0 -> master soft_clip(-1.0)
+    assert_eq!(prod.push_i32(&samples_i32), MIX_BLOCK_FRAMES * 2);
+
+    mixer.mix_block(&mut out);
+    assert!((out[0] - (-0.5)).abs() < 1e-5);
+    assert!((out[1] - 0.5).abs() < 1e-5);
+    assert!((out[2] - soft_clip(-1.0)).abs() < 1e-5);
+}

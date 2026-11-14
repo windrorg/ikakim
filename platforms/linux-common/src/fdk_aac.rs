@@ -204,11 +204,15 @@ impl FdkAacEncoder {
         let frame_samples = AAC_FRAME_SAMPLES * AUDIO_CHANNELS;
         while self.pcm_i16_queue.len() >= frame_samples {
             self.in_frame_buf.clear();
-            for _ in 0..frame_samples {
-                if let Some(s) = self.pcm_i16_queue.pop_front() {
-                    self.in_frame_buf.push(s);
-                }
+            let (front, back) = self.pcm_i16_queue.as_slices();
+            if front.len() >= frame_samples {
+                self.in_frame_buf.extend_from_slice(&front[..frame_samples]);
+            } else {
+                self.in_frame_buf.extend_from_slice(front);
+                self.in_frame_buf
+                    .extend_from_slice(&back[..frame_samples - front.len()]);
             }
+            self.pcm_i16_queue.drain(..frame_samples);
 
             let mut in_ptr = self.in_frame_buf.as_mut_ptr() as *mut c_void;
             let mut in_id = IN_AUDIO_DATA;

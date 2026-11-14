@@ -1587,11 +1587,22 @@ fn test_engine_virtual_av_pipeline_compositor_and_mixer_verification() {
         l_1200_b
     );
 
-    let rms_c_l = channel_rms_dbfs(pcm_c, 2, 0);
-    let rms_c_r = channel_rms_dbfs(pcm_c, 2, 1);
+    // First block of Phase C performs the click-free de-zippering ramp to 0.0;
+    // all subsequent blocks in Phase C must be completely silent.
+    let ramp_samples = MIX_BLOCK_FRAMES * 2;
+    assert!(pcm_c.len() > ramp_samples * 2);
+    assert!(
+        pcm_c[ramp_samples - 2].abs() < 1e-5 && pcm_c[ramp_samples - 1].abs() < 1e-5,
+        "end of Phase C de-zipper ramp block should reach 0.0, got ({}, {})",
+        pcm_c[ramp_samples - 2],
+        pcm_c[ramp_samples - 1]
+    );
+    let pcm_c_steady = &pcm_c[ramp_samples..];
+    let rms_c_l = channel_rms_dbfs(pcm_c_steady, 2, 0);
+    let rms_c_r = channel_rms_dbfs(pcm_c_steady, 2, 1);
     assert!(
         rms_c_l < -60.0 && rms_c_r < -60.0,
-        "Phase C muted channels should be silent (L={} dBFS, R={} dBFS)",
+        "Phase C muted channels should be silent after 1-block ramp (L={} dBFS, R={} dBFS)",
         rms_c_l,
         rms_c_r
     );

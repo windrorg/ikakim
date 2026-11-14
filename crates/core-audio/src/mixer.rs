@@ -1,5 +1,5 @@
 use crate::delay::StereoDelayLine;
-use crate::meter::{db_to_linear, AtomicPeakStereo};
+use crate::meter::{db_to_linear, linear_to_db, AtomicPeakStereo};
 use crate::resampler::PolyphaseResampler;
 use crate::{AUDIO_CHANNELS, MAX_DELAY_MS, MIX_BLOCK_FRAMES};
 use core_types::clock::{MasterClock, SampleTime, MASTER_SAMPLE_RATE};
@@ -35,13 +35,87 @@ impl Default for AudioInputConfig {
     }
 }
 
+/// チャンネルおよびマスターバスで共有するロックフリーのストリップ制御パラメータ
+struct AtomicStripParams {
+    gain_bits: AtomicU32,
+    muted: AtomicBool,
+    peak: AtomicPeakStereo,
+}
+
+impl AtomicStripParams {
+    fn new(initial_gain: f32, initial_muted: bool) -> Self {
+        let sanitized_gain = if initial_gain.is_finite() {
+            initial_gain.clamp(0.0, 4.0)
+        } else {
+            1.0
+        };
+        Self {
+            gain_bits: AtomicU32::new(sanitized_gain.to_bits()),
+            muted: AtomicBool::new(initial_muted),
+            peak: AtomicPeakStereo::new(),
+        }
+    }
+
+    #[inline]
+    fn set_gain_linear(&self, gain: f32) {
+        let sanitized = if gain.is_finite() {
+            gain.clamp(0.0, 4.0)
+        } else {
+            0.0
+        };
+        self.gain_bits.store(sanitized.to_bits(), Ordering::Release);
+    }
+
+    #[inline]
+    fn set_gain_db(&self, db: f32) {
+        self.set_gain_linear(db_to_linear(db));
+    }
+
+    #[inline]
+    fn gain_linear(&self) -> f32 {
+        f32::from_bits(self.gain_bits.load(Ordering::Acquire))
+    }
+
+    #[inline]
+    fn gain_db(&self) -> f32 {
+        linear_to_db(self.gain_linear())
+    }
+
+    #[inline]
+    fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Release);
+    }
+
+    #[inline]
+    fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn effective_target_gain(&self) -> f32 {
+        if self.is_muted() {
+            0.0
+        } else {
+            self.gain_linear()
+        }
+    }
+
+    #[inline]
+    fn take_peak_dbfs(&self) -> (f32, f32) {
+        self.peak.take_dbfs()
+    }
+
+    #[inline]
+    fn peek_peak_dbfs(&self) -> (f32, f32) {
+        self.peak.peek_dbfs()
+    }
+}
+
 struct ChannelControl {
     id: ChannelId,
     name: String,
-    gain_bits: AtomicU32,
-    muted: AtomicBool,
+    strip: AtomicStripParams,
     delay_ms: AtomicU32,
-    peak: AtomicPeakStereo,
 }
 
 impl ChannelControl {
@@ -49,10 +123,8 @@ impl ChannelControl {
         Self {
             id,
             name: config.name.clone(),
-            gain_bits: AtomicU32::new(config.initial_gain.max(0.0).to_bits()),
-            muted: AtomicBool::new(config.initial_muted),
+            strip: AtomicStripParams::new(config.initial_gain, config.initial_muted),
             delay_ms: AtomicU32::new(config.initial_delay_ms.min(MAX_DELAY_MS)),
-            peak: AtomicPeakStereo::new(),
         }
     }
 }
@@ -73,25 +145,27 @@ impl ChannelHandle {
     }
 
     pub fn set_gain_linear(&self, gain: f32) {
-        self.ctrl
-            .gain_bits
-            .store(gain.clamp(0.0, 4.0).to_bits(), Ordering::Release);
+        self.ctrl.strip.set_gain_linear(gain);
     }
 
     pub fn set_gain_db(&self, db: f32) {
-        self.set_gain_linear(db_to_linear(db));
+        self.ctrl.strip.set_gain_db(db);
     }
 
     pub fn gain_linear(&self) -> f32 {
-        f32::from_bits(self.ctrl.gain_bits.load(Ordering::Acquire))
+        self.ctrl.strip.gain_linear()
+    }
+
+    pub fn gain_db(&self) -> f32 {
+        self.ctrl.strip.gain_db()
     }
 
     pub fn set_muted(&self, muted: bool) {
-        self.ctrl.muted.store(muted, Ordering::Release);
+        self.ctrl.strip.set_muted(muted);
     }
 
     pub fn is_muted(&self) -> bool {
-        self.ctrl.muted.load(Ordering::Acquire)
+        self.ctrl.strip.is_muted()
     }
 
     pub fn set_delay_ms(&self, delay_ms: u32) {
@@ -105,18 +179,16 @@ impl ChannelHandle {
     }
 
     pub fn take_peak_dbfs(&self) -> (f32, f32) {
-        self.ctrl.peak.take_dbfs()
+        self.ctrl.strip.take_peak_dbfs()
     }
 
     pub fn peek_peak_dbfs(&self) -> (f32, f32) {
-        self.ctrl.peak.peek_dbfs()
+        self.ctrl.strip.peek_peak_dbfs()
     }
 }
 
 struct MasterControl {
-    gain_bits: AtomicU32,
-    muted: AtomicBool,
-    peak: AtomicPeakStereo,
+    strip: AtomicStripParams,
 }
 
 /// マスター出力の制御・ピーク取得ハンドル
@@ -127,33 +199,35 @@ pub struct MasterHandle {
 
 impl MasterHandle {
     pub fn set_gain_linear(&self, gain: f32) {
-        self.ctrl
-            .gain_bits
-            .store(gain.clamp(0.0, 4.0).to_bits(), Ordering::Release);
+        self.ctrl.strip.set_gain_linear(gain);
     }
 
     pub fn set_gain_db(&self, db: f32) {
-        self.set_gain_linear(db_to_linear(db));
+        self.ctrl.strip.set_gain_db(db);
     }
 
     pub fn gain_linear(&self) -> f32 {
-        f32::from_bits(self.ctrl.gain_bits.load(Ordering::Acquire))
+        self.ctrl.strip.gain_linear()
+    }
+
+    pub fn gain_db(&self) -> f32 {
+        self.ctrl.strip.gain_db()
     }
 
     pub fn set_muted(&self, muted: bool) {
-        self.ctrl.muted.store(muted, Ordering::Release);
+        self.ctrl.strip.set_muted(muted);
     }
 
     pub fn is_muted(&self) -> bool {
-        self.ctrl.muted.load(Ordering::Acquire)
+        self.ctrl.strip.is_muted()
     }
 
     pub fn take_peak_dbfs(&self) -> (f32, f32) {
-        self.ctrl.peak.take_dbfs()
+        self.ctrl.strip.take_peak_dbfs()
     }
 
     pub fn peek_peak_dbfs(&self) -> (f32, f32) {
-        self.ctrl.peak.peek_dbfs()
+        self.ctrl.strip.peek_peak_dbfs()
     }
 }
 
@@ -199,23 +273,19 @@ impl AudioInputProducer {
 
     /// S16_LE 整数PCM（ALSA等）を f32 [-1.0, 1.0] に正規化して投入する
     pub fn push_i16(&mut self, interleaved_i16: &[i16]) -> usize {
-        self.scratch_f32.clear();
-        self.scratch_f32.reserve(interleaved_i16.len());
         const INV_I16: f32 = 1.0 / 32768.0;
-        for &s in interleaved_i16 {
-            self.scratch_f32.push(s as f32 * INV_I16);
-        }
+        self.scratch_f32.clear();
+        self.scratch_f32
+            .extend(interleaved_i16.iter().map(|&s| f32::from(s) * INV_I16));
         self.push_scratch_f32()
     }
 
     /// S32_LE 整数PCM（ALSAプロ向け等）を f32 [-1.0, 1.0] に正規化して投入する
     pub fn push_i32(&mut self, interleaved_i32: &[i32]) -> usize {
-        self.scratch_f32.clear();
-        self.scratch_f32.reserve(interleaved_i32.len());
         const INV_I32: f32 = 1.0 / 2_147_483_648.0;
-        for &s in interleaved_i32 {
-            self.scratch_f32.push(s as f32 * INV_I32);
-        }
+        self.scratch_f32.clear();
+        self.scratch_f32
+            .extend(interleaved_i32.iter().map(|&s| s as f32 * INV_I32));
         self.push_scratch_f32()
     }
 
@@ -229,6 +299,92 @@ struct ChannelRuntime {
     consumer: SpscConsumer<f32>,
     delay_line: StereoDelayLine,
     scratch: Vec<f32>,
+    current_gain: f32,
+}
+
+impl ChannelRuntime {
+    /// 1チャンネル分の入力読み出し・ディレイ・スムージング付きゲイン乗算・マスターバスへの加算を実行する
+    #[inline]
+    fn mix_into_bus(&mut self, out_interleaved: &mut [f32], max_input_backlog_samples: usize) {
+        let sample_count = out_interleaved.len();
+        let frame_count = sample_count / AUDIO_CHANNELS;
+        if frame_count == 0 {
+            return;
+        }
+
+        if self.scratch.len() < sample_count {
+            self.scratch.resize(sample_count, 0.0);
+        }
+        let buf = &mut self.scratch[..sample_count];
+
+        // 遅延蓄積が上限を超えている場合は古いサンプルを一括破棄してリアルタイム性を維持
+        let avail = self.consumer.available_read();
+        if avail > max_input_backlog_samples {
+            let excess = ((avail - sample_count) / AUDIO_CHANNELS) * AUDIO_CHANNELS;
+            self.consumer.discard(excess);
+        }
+
+        let target_delay = self.ctrl.delay_ms.load(Ordering::Acquire);
+        self.delay_line.set_delay_ms(target_delay);
+        let target_gain = self.ctrl.strip.effective_target_gain();
+
+        let read = self.consumer.pop_slice(buf);
+        if read == 0 {
+            // 新規入力が無く、ディレイラインも無音に収束していれば 512KB バッファ走査も加算もスキップ
+            if self.delay_line.process_known_silent_in_place(buf) {
+                self.current_gain = target_gain;
+                self.ctrl.strip.peak.observe(0.0, 0.0);
+                return;
+            }
+        } else {
+            if read < sample_count {
+                buf[read..].fill(0.0);
+            }
+            self.delay_line.process_in_place(buf);
+        }
+
+        // ミュート定常状態（開始ゲイン・目標ゲインとも 0.0）ならディレイライン更新のみでバス加算をスキップ
+        if self.current_gain == 0.0 && target_gain == 0.0 {
+            self.ctrl.strip.peak.observe(0.0, 0.0);
+            return;
+        }
+
+        let mut peak_l = 0.0f32;
+        let mut peak_r = 0.0f32;
+
+        if (target_gain - self.current_gain).abs() <= 1e-6 {
+            let gain = target_gain;
+            self.current_gain = target_gain;
+            for (dst, src) in out_interleaved.chunks_exact_mut(2).zip(buf.chunks_exact(2)) {
+                let l = src[0] * gain;
+                let r = src[1] * gain;
+                peak_l = peak_l.max(l.abs());
+                peak_r = peak_r.max(r.abs());
+                dst[0] += l;
+                dst[1] += r;
+            }
+        } else {
+            // ゲイン変更・ミュート切替時のクリックノイズを防ぐブロック内線形ランプ（De-zippering）
+            let start_gain = self.current_gain;
+            let step = (target_gain - start_gain) / frame_count as f32;
+            for (i, (dst, src)) in out_interleaved
+                .chunks_exact_mut(2)
+                .zip(buf.chunks_exact(2))
+                .enumerate()
+            {
+                let gain = start_gain + (i as f32 + 1.0) * step;
+                let l = src[0] * gain;
+                let r = src[1] * gain;
+                peak_l = peak_l.max(l.abs());
+                peak_r = peak_r.max(r.abs());
+                dst[0] += l;
+                dst[1] += r;
+            }
+            self.current_gain = target_gain;
+        }
+
+        self.ctrl.strip.peak.observe(peak_l, peak_r);
+    }
 }
 
 /// UI 通知用の全チャンネル・マスタースナップショット（30Hz 送信向け）
@@ -258,6 +414,7 @@ pub struct AudioMixer {
     next_id: u32,
     channels: Vec<ChannelRuntime>,
     master: Arc<MasterControl>,
+    master_current_gain: f32,
     /// ジッター・ドリフト吸収用に各入力SPSCへ許す最大滞留サンプル数（超えたら古いサンプルを間引く）
     max_input_backlog_samples: usize,
 }
@@ -269,10 +426,9 @@ impl AudioMixer {
             next_id: 1,
             channels: Vec::new(),
             master: Arc::new(MasterControl {
-                gain_bits: AtomicU32::new(1.0f32.to_bits()),
-                muted: AtomicBool::new(false),
-                peak: AtomicPeakStereo::new(),
+                strip: AtomicStripParams::new(1.0, false),
             }),
+            master_current_gain: 1.0,
             // 48kHz * 2ch * 120ms = 11,520 floats
             max_input_backlog_samples: (MASTER_SAMPLE_RATE as usize * AUDIO_CHANNELS * 120) / 1000,
         }
@@ -301,6 +457,7 @@ impl AudioMixer {
         let (producer, consumer) = spsc_channel::<f32>(ring_capacity);
 
         let ctrl = Arc::new(ChannelControl::new(id, &config));
+        let initial_effective_gain = ctrl.strip.effective_target_gain();
         let delay_line = StereoDelayLine::new(config.initial_delay_ms);
         let resampler = PolyphaseResampler::new(config.sample_rate, config.channels);
 
@@ -309,6 +466,7 @@ impl AudioMixer {
             consumer,
             delay_line,
             scratch: vec![0.0f32; MIX_BLOCK_FRAMES * AUDIO_CHANNELS],
+            current_gain: initial_effective_gain,
         });
 
         let handle = ChannelHandle { ctrl };
@@ -334,17 +492,17 @@ impl AudioMixer {
 
     /// UI 送信用に、全チャンネルとマスターの現在の設定値・ピークレベル（リセット付き）を取得する
     pub fn take_snapshot(&self) -> MixerSnapshot {
-        let (master_peak_l_dbfs, master_peak_r_dbfs) = self.master.peak.take_dbfs();
+        let (master_peak_l_dbfs, master_peak_r_dbfs) = self.master.strip.take_peak_dbfs();
         let channels = self
             .channels
             .iter()
             .map(|c| {
-                let (peak_l_dbfs, peak_r_dbfs) = c.ctrl.peak.take_dbfs();
+                let (peak_l_dbfs, peak_r_dbfs) = c.ctrl.strip.take_peak_dbfs();
                 ChannelSnapshot {
                     id: c.ctrl.id,
                     name: c.ctrl.name.clone(),
-                    gain_linear: f32::from_bits(c.ctrl.gain_bits.load(Ordering::Acquire)),
-                    muted: c.ctrl.muted.load(Ordering::Acquire),
+                    gain_linear: c.ctrl.strip.gain_linear(),
+                    muted: c.ctrl.strip.is_muted(),
                     delay_ms: c.ctrl.delay_ms.load(Ordering::Acquire),
                     peak_l_dbfs,
                     peak_r_dbfs,
@@ -353,8 +511,8 @@ impl AudioMixer {
             .collect();
 
         MixerSnapshot {
-            master_gain_linear: f32::from_bits(self.master.gain_bits.load(Ordering::Acquire)),
-            master_muted: self.master.muted.load(Ordering::Acquire),
+            master_gain_linear: self.master.strip.gain_linear(),
+            master_muted: self.master.strip.is_muted(),
             master_peak_l_dbfs,
             master_peak_r_dbfs,
             channels,
@@ -371,74 +529,60 @@ impl AudioMixer {
 
         out_interleaved.fill(0.0);
 
+        let max_backlog = self.max_input_backlog_samples;
         for ch in &mut self.channels {
-            if ch.scratch.len() < sample_count {
-                ch.scratch.resize(sample_count, 0.0);
-            }
-            let buf = &mut ch.scratch[..sample_count];
-
-            // 遅延蓄積が上限を超えている場合は古いサンプルを一括破棄してリアルタイム性を維持
-            let avail = ch.consumer.available_read();
-            if avail > self.max_input_backlog_samples {
-                let excess = ((avail - sample_count) / 2) * 2;
-                ch.consumer.discard(excess);
-            }
-
-            let read = ch.consumer.pop_slice(buf);
-            if read < sample_count {
-                buf[read..].fill(0.0);
-            }
-
-            // 入力ごとのディレイラインはミュート中も連続更新して位相・残響の途切れを防ぐ
-            let target_delay = ch.ctrl.delay_ms.load(Ordering::Acquire);
-            ch.delay_line.set_delay_ms(target_delay);
-            ch.delay_line.process_in_place(buf);
-
-            let muted = ch.ctrl.muted.load(Ordering::Acquire);
-            let gain = if muted {
-                0.0
-            } else {
-                f32::from_bits(ch.ctrl.gain_bits.load(Ordering::Acquire))
-            };
-
-            let mut peak_l = 0.0f32;
-            let mut peak_r = 0.0f32;
-
-            for (dst, src) in out_interleaved.chunks_exact_mut(2).zip(buf.chunks_exact(2)) {
-                let l = src[0] * gain;
-                let r = src[1] * gain;
-                peak_l = peak_l.max(l.abs());
-                peak_r = peak_r.max(r.abs());
-                dst[0] += l;
-                dst[1] += r;
-            }
-
-            ch.ctrl.peak.observe(peak_l, peak_r);
+            ch.mix_into_bus(out_interleaved, max_backlog);
         }
 
-        // マスターボリューム・ミュート・ソフトクリッパー適用
-        let master_muted = self.master.muted.load(Ordering::Acquire);
-        let master_gain = if master_muted {
-            0.0
-        } else {
-            f32::from_bits(self.master.gain_bits.load(Ordering::Acquire))
-        };
+        self.apply_master_bus(out_interleaved);
+        self.clock.advance_samples(frame_count as u64);
+        block_start_samples
+    }
+
+    #[inline]
+    fn apply_master_bus(&mut self, out_interleaved: &mut [f32]) {
+        let frame_count = out_interleaved.len() / AUDIO_CHANNELS;
+        if frame_count == 0 {
+            return;
+        }
+
+        let target_gain = self.master.strip.effective_target_gain();
+        if self.master_current_gain == 0.0 && target_gain == 0.0 {
+            out_interleaved.fill(0.0);
+            self.master.strip.peak.observe(0.0, 0.0);
+            return;
+        }
 
         let mut master_peak_l = 0.0f32;
         let mut master_peak_r = 0.0f32;
 
-        for frame in out_interleaved.chunks_exact_mut(2) {
-            let l = soft_clip(frame[0] * master_gain);
-            let r = soft_clip(frame[1] * master_gain);
-            frame[0] = l;
-            frame[1] = r;
-            master_peak_l = master_peak_l.max(l.abs());
-            master_peak_r = master_peak_r.max(r.abs());
+        if (target_gain - self.master_current_gain).abs() <= 1e-6 {
+            let master_gain = target_gain;
+            self.master_current_gain = target_gain;
+            for frame in out_interleaved.chunks_exact_mut(2) {
+                let l = soft_clip(frame[0] * master_gain);
+                let r = soft_clip(frame[1] * master_gain);
+                frame[0] = l;
+                frame[1] = r;
+                master_peak_l = master_peak_l.max(l.abs());
+                master_peak_r = master_peak_r.max(r.abs());
+            }
+        } else {
+            let start_gain = self.master_current_gain;
+            let step = (target_gain - start_gain) / frame_count as f32;
+            for (i, frame) in out_interleaved.chunks_exact_mut(2).enumerate() {
+                let master_gain = start_gain + (i as f32 + 1.0) * step;
+                let l = soft_clip(frame[0] * master_gain);
+                let r = soft_clip(frame[1] * master_gain);
+                frame[0] = l;
+                frame[1] = r;
+                master_peak_l = master_peak_l.max(l.abs());
+                master_peak_r = master_peak_r.max(r.abs());
+            }
+            self.master_current_gain = target_gain;
         }
 
-        self.master.peak.observe(master_peak_l, master_peak_r);
-        self.clock.advance_samples(frame_count as u64);
-        block_start_samples
+        self.master.strip.peak.observe(master_peak_l, master_peak_r);
     }
 }
 

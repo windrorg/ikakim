@@ -278,12 +278,10 @@ impl ControlBackend for EngineControlBridge {
                     .find(|x| x.0 == id)
                     .map(|x| (x.1, x.2))
                     .unwrap_or((-96.0, -96.0));
-                let lin = ch.gain_linear();
-                let gain_db = if lin <= 1e-5 { -96.0 } else { 20.0 * lin.log10() };
                 AudioChannelState {
                     id,
                     name: ch.name().to_string(),
-                    gain_db,
+                    gain_db: ch.gain_db(),
                     delay_ms: ch.delay_ms() as f32,
                     muted: ch.is_muted(),
                     left_dbfs: l,
