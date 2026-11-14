@@ -566,6 +566,7 @@ fn test_apple_1080p60_zero_copy_all_use_cases_performance_and_stability() {
         );
         let mut main_pool = AppleZeroCopyRenderSurfacePool::new(&importer, &comp.context().device, W, H, 6)
             .expect("main pool");
+        main_pool.prebind_preview_blit(&comp);
         let mut prev_pool = AppleZeroCopyRenderSurfacePool::new(&importer, &comp.context().device, PW, PH, 6)
             .expect("prev pool");
 
@@ -616,6 +617,27 @@ fn test_apple_1080p60_zero_copy_all_use_cases_performance_and_stability() {
 
         let mut frame_ms = Vec::with_capacity(MEASURED as usize);
         let mut total_audio_samples = 0u64;
+        let mut imported_base = importer
+            .import_to_gpu_layer(&comp, &prebaked_main[0], 0, true, bridge.layer_transform(0))
+            .expect("import base");
+        let mut imported_pip = prebaked_pip.as_ref().map(|ring| {
+            importer
+                .import_to_gpu_layer(&comp, &ring[0], 1, false, bridge.layer_transform(1))
+                .expect("import pip")
+        });
+        let mut imported_ov = overlay_pb.as_ref().map(|pb| {
+            importer
+                .import_to_gpu_layer(&comp, pb, 2, false, LayerTransform {
+                    x: 0.55,
+                    y: 0.72,
+                    scale_x: 0.25,
+                    scale_y: 0.15,
+                    z_order: 2,
+                    opacity: 0.85,
+                    ..Default::default()
+                })
+                .expect("import overlay")
+        });
 
         for idx in 0..(WARMUP + MEASURED) {
             let t0 = Instant::now();
@@ -637,33 +659,14 @@ fn test_apple_1080p60_zero_copy_all_use_cases_performance_and_stability() {
             }
 
             let base_pb = &prebaked_main[(idx as usize) % prebaked_main.len()];
-            let mut imported_base = importer
-                .import_to_gpu_layer(&comp, base_pb, 0, true, bridge.layer_transform(0))
-                .expect("import base");
-            let mut imported_pip = prebaked_pip.as_ref().map(|ring| {
+            importer
+                .update_gpu_layer(&comp, &mut imported_base, base_pb)
+                .expect("update base");
+            if let (Some(pip), Some(ring)) = (imported_pip.as_mut(), prebaked_pip.as_ref()) {
                 importer
-                    .import_to_gpu_layer(
-                        &comp,
-                        &ring[(idx as usize) % ring.len()],
-                        1,
-                        false,
-                        bridge.layer_transform(1),
-                    )
-                    .expect("import pip")
-            });
-            let mut imported_ov = overlay_pb.as_ref().map(|pb| {
-                importer
-                    .import_to_gpu_layer(&comp, pb, 2, false, LayerTransform {
-                        x: 0.55,
-                        y: 0.72,
-                        scale_x: 0.25,
-                        scale_y: 0.15,
-                        z_order: 2,
-                        opacity: 0.85,
-                        ..Default::default()
-                    })
-                    .expect("import overlay")
-            });
+                    .update_gpu_layer(&comp, pip, &ring[(idx as usize) % ring.len()])
+                    .expect("update pip");
+            }
 
             {
                 let mut refs: Vec<&mut core_gpu::GpuLayer> = vec![&mut imported_base.layer];

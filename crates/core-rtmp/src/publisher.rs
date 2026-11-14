@@ -55,6 +55,7 @@ struct SharedQueue {
 /// バックグラウンド送信スレッド・AIMD ABR 監視・自動再接続バックオフを備えた RTMPS パブリッシャー
 pub struct RtmpPublisher {
     queue: Arc<(Mutex<SharedQueue>, Condvar)>,
+    queued_bytes_atomic: Arc< std::sync::atomic::AtomicUsize>,
     stop_flag: Arc<AtomicBool>,
     bytes_sent: Arc<AtomicU64>,
     packets_sent: Arc<AtomicU64>,
@@ -65,6 +66,15 @@ pub struct RtmpPublisher {
     max_queue_bytes: usize,
     join_handle: Option<JoinHandle<()>>,
     abr_handle: Option<JoinHandle<()>>,
+}
+
+fn sleep_interruptible(duration_ms: u64, stop_flag: &AtomicBool) {
+    let sleep_step = Duration::from_millis(50);
+    let mut waited = 0u64;
+    while waited < duration_ms && !stop_flag.load(Ordering::Acquire) {
+        thread::sleep(sleep_step);
+        waited += 50;
+    }
 }
 
 impl RtmpPublisher {
@@ -87,6 +97,7 @@ impl RtmpPublisher {
             Condvar::new(),
         ));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let queued_bytes_atomic = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let is_connected = Arc::new(AtomicBool::new(false));
         let drop_non_idr_flag = Arc::new(AtomicBool::new(false));
         let bytes_sent = Arc::new(AtomicU64::new(0));
@@ -97,6 +108,7 @@ impl RtmpPublisher {
         let on_event_shared = Arc::new(Mutex::new(on_event));
 
         let q_clone = Arc::clone(&queue);
+        let q_bytes_pub = Arc::clone(&queued_bytes_atomic);
         let stop_clone = Arc::clone(&stop_flag);
         let conn_clone = Arc::clone(&is_connected);
         let drop_flag_pub = Arc::clone(&drop_non_idr_flag);
@@ -109,7 +121,7 @@ impl RtmpPublisher {
 
         // ABR 評価を送信ソケット I/O から独立したスレッドで実行し、TCP 詰まり中でも即座にエンコーダ減速させる
         let abr_cfg = config.abr.clone();
-        let q_abr = Arc::clone(&queue);
+        let q_bytes_abr = Arc::clone(&queued_bytes_atomic);
         let stop_abr = Arc::clone(&stop_flag);
         let conn_abr = Arc::clone(&is_connected);
         let drop_flag_abr = Arc::clone(&drop_non_idr_flag);
@@ -131,7 +143,7 @@ impl RtmpPublisher {
                     }
                     let elapsed = last_tick.elapsed();
                     if elapsed >= Duration::from_millis(200) {
-                        let q_bytes = { q_abr.0.lock().unwrap().queued_bytes };
+                        let q_bytes = q_bytes_abr.load(Ordering::Acquire);
                         let decision = abr.evaluate(q_bytes, elapsed.as_millis() as u64);
                         last_tick = Instant::now();
                         drop_flag_abr.store(decision.drop_non_idr, Ordering::Release);
@@ -197,12 +209,7 @@ impl RtmpPublisher {
                                 }
                             }
                             emit(PublisherEvent::StateChanged(PipelineState::Reconnecting));
-                            let sleep_step = Duration::from_millis(50);
-                            let mut waited = 0u64;
-                            while waited < backoff_ms && !stop_clone.load(Ordering::Acquire) {
-                                thread::sleep(sleep_step);
-                                waited += 50;
-                            }
+                            sleep_interruptible(backoff_ms, &stop_clone);
                             backoff_ms = (backoff_ms * 2).min(config.reconnect_max_ms.max(1000));
                             continue 'outer;
                         }
@@ -277,6 +284,7 @@ impl RtmpPublisher {
                             }
                             if let Some(pkt) = guard.items.pop_front() {
                                 guard.queued_bytes = guard.queued_bytes.saturating_sub(pkt.data.len());
+                                q_bytes_pub.store(guard.queued_bytes, Ordering::Release);
                                 Some(pkt)
                             } else if guard.closed {
                                 client.close();
@@ -323,12 +331,7 @@ impl RtmpPublisher {
                                         "RTMP send failed, reconnecting: {}",
                                         e
                                     )));
-                                    let sleep_step = Duration::from_millis(50);
-                                    let mut waited = 0u64;
-                                    while waited < backoff_ms && !stop_clone.load(Ordering::Acquire) {
-                                        thread::sleep(sleep_step);
-                                        waited += 50;
-                                    }
+                                    sleep_interruptible(backoff_ms, &stop_clone);
                                     break;
                                 }
                             }
@@ -344,12 +347,7 @@ impl RtmpPublisher {
                                     "RTMP connection closed/error from peer, reconnecting: {}",
                                     e
                                 )));
-                                let sleep_step = Duration::from_millis(50);
-                                let mut waited = 0u64;
-                                while waited < backoff_ms && !stop_clone.load(Ordering::Acquire) {
-                                    thread::sleep(sleep_step);
-                                    waited += 50;
-                                }
+                                sleep_interruptible(backoff_ms, &stop_clone);
                                 break;
                             }
                         }
@@ -361,6 +359,7 @@ impl RtmpPublisher {
 
         Self {
             queue,
+            queued_bytes_atomic,
             stop_flag,
             bytes_sent,
             packets_sent,
@@ -407,13 +406,15 @@ impl RtmpPublisher {
         }
 
         guard.queued_bytes += packet.data.len();
+        self.queued_bytes_atomic
+            .store(guard.queued_bytes, Ordering::Release);
         guard.items.push_back(packet);
         cvar.notify_one();
         Ok(())
     }
 
     pub fn stats(&self) -> PublisherStats {
-        let queued_bytes = self.queue.0.lock().unwrap().queued_bytes;
+        let queued_bytes = self.queued_bytes_atomic.load(Ordering::Acquire);
         PublisherStats {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             packets_sent: self.packets_sent.load(Ordering::Relaxed),

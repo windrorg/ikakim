@@ -164,6 +164,7 @@ fn macos_main(args: &[String]) {
             target_fps: fps,
         },
     );
+    main_pool.prebind_preview_blit(&comp);
 
     let mut main_enc =
         VtH264Encoder::new(width, height, fps, initial_bitrate_bps).expect("VT main enc");
@@ -198,6 +199,9 @@ fn macos_main(args: &[String]) {
     let frame_dur = Duration::from_nanos(1_000_000_000u64 / fps as u64);
     let pace_realtime = max_frames == 0 || rtmp_url.is_some();
     let mut frame_us_samples: Vec<u64> = Vec::with_capacity(max_frames.min(1024) as usize);
+    let mut layer = importer
+        .import_to_gpu_layer(&comp, &input_pbs[0], 0, true, bridge.layer_transform(0))
+        .expect("import initial layer");
 
     loop {
         if max_frames > 0 && i >= max_frames {
@@ -207,9 +211,9 @@ fn macos_main(args: &[String]) {
         let pts = PtsUs((i * 1_000_000) / fps as u64);
 
         let pb = &input_pbs[(i as usize) % input_pbs.len()];
-        let mut layer = importer
-            .import_to_gpu_layer(&comp, pb, 0, true, bridge.layer_transform(0))
-            .expect("import layer");
+        importer
+            .update_gpu_layer(&comp, &mut layer, pb)
+            .expect("update zero-copy layer");
 
         let mut refs = [&mut layer.layer];
         bridge.apply_pending_transforms(&comp, &mut refs);

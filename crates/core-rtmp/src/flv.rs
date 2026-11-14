@@ -16,40 +16,38 @@ pub fn pack_video_tag(packet: &EncodedPacket) -> CoreResult<Vec<u8>> {
     }
 
     if packet.is_sequence_header {
-        // AVCDecoderConfigurationRecord がすでに渡された場合はそのまま使用、
+        // AVCDecoderConfigurationRecord がすでに渡された場合はクローンせず直接書き込み、
         // Annex-B (SPS+PPS) が渡された場合は変換する
-        let config_record = if looks_like_annexb(&packet.data) {
-            build_avc_decoder_config_from_annexb(&packet.data)?
+        if looks_like_annexb(&packet.data) {
+            let config_record = build_avc_decoder_config_from_annexb(&packet.data)?;
+            let mut out = Vec::with_capacity(5 + config_record.len());
+            out.extend_from_slice(&[0x17, 0x00, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&config_record);
+            return Ok(out);
         } else {
-            packet.data.clone()
-        };
-
-        let mut out = Vec::with_capacity(5 + config_record.len());
-        out.push(0x17); // Keyframe (1) + AVC (7)
-        out.push(0x00); // AVC sequence header
-        out.extend_from_slice(&[0x00, 0x00, 0x00]); // CompositionTime = 0
-        out.extend_from_slice(&config_record);
-        return Ok(out);
+            let mut out = Vec::with_capacity(5 + packet.data.len());
+            out.extend_from_slice(&[0x17, 0x00, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&packet.data);
+            return Ok(out);
+        }
     }
-
-    let avcc_payload = if looks_like_annexb(&packet.data) {
-        annexb_to_avcc(&packet.data)
-    } else {
-        packet.data.clone()
-    };
 
     let pts_ms = packet.pts.0 / 1_000;
     let dts_ms = packet.dts.0 / 1_000;
     let cts_ms = pts_ms.saturating_sub(dts_ms).min(0xFF_FFFF) as i32;
 
     let frame_type: u8 = if packet.is_keyframe { 0x10 } else { 0x20 };
-    let mut out = Vec::with_capacity(5 + avcc_payload.len());
+    let mut out = Vec::with_capacity(5 + packet.data.len() + 16);
     out.push(frame_type | 0x07); // AVC codec ID = 7
     out.push(0x01); // AVC NALU
     out.push(((cts_ms >> 16) & 0xFF) as u8);
     out.push(((cts_ms >> 8) & 0xFF) as u8);
     out.push((cts_ms & 0xFF) as u8);
-    out.extend_from_slice(&avcc_payload);
+    if looks_like_annexb(&packet.data) {
+        append_annexb_to_avcc(&packet.data, &mut out);
+    } else {
+        out.extend_from_slice(&packet.data);
+    }
     Ok(out)
 }
 
@@ -109,10 +107,21 @@ pub fn split_annexb_nalus(data: &[u8]) -> Vec<&[u8]> {
     let mut i = 0;
     let mut nalu_start = None;
 
-    while i < data.len() {
+    while i + 3 <= data.len() {
+        if data[i] != 0 {
+            if let Some(rel) = data[i..].iter().position(|&b| b == 0) {
+                i += rel;
+                if i + 3 > data.len() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
         let sc_len = if i + 4 <= data.len() && data[i..i + 4] == [0x00, 0x00, 0x00, 0x01] {
             4
-        } else if i + 3 <= data.len() && data[i..i + 3] == [0x00, 0x00, 0x01] {
+        } else if data[i..i + 3] == [0x00, 0x00, 0x01] {
             3
         } else {
             0
@@ -139,15 +148,17 @@ pub fn split_annexb_nalus(data: &[u8]) -> Vec<&[u8]> {
     nalus
 }
 
-/// Annex-B NALU 列を 4バイト長プレフィックス付き AVCC 列へ変換する（SPS/PPS を除くスライス・AUD 等をそのまま変換）
-pub fn annexb_to_avcc(annexb: &[u8]) -> Vec<u8> {
-    let nalus = split_annexb_nalus(annexb);
-    let total: usize = nalus.iter().map(|n| 4 + n.len()).sum();
-    let mut out = Vec::with_capacity(total);
-    for nalu in nalus {
+fn append_annexb_to_avcc(annexb: &[u8], out: &mut Vec<u8>) {
+    for nalu in split_annexb_nalus(annexb) {
         out.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
         out.extend_from_slice(nalu);
     }
+}
+
+/// Annex-B NALU 列を 4バイト長プレフィックス付き AVCC 列へ変換する（SPS/PPS を除くスライス・AUD 等をそのまま変換）
+pub fn annexb_to_avcc(annexb: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(annexb.len() + 16);
+    append_annexb_to_avcc(annexb, &mut out);
     out
 }
 

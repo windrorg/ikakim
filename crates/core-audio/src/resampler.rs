@@ -131,12 +131,14 @@ impl PolyphaseResampler {
     fn convolve(&self, phase_idx: usize) -> (f32, f32) {
         let row = &self.coeffs[phase_idx * TAPS..(phase_idx + 1) * TAPS];
         let base = self.hist_pos;
+        let hl = &self.hist_l[base..base + TAPS];
+        let hr = &self.hist_r[base..base + TAPS];
         let mut acc_l = 0.0f32;
         let mut acc_r = 0.0f32;
-        for (k, &c) in row.iter().enumerate() {
-            // 最も古いサンプルから最新サンプルへ向けて畳み込む
-            acc_l += self.hist_l[base + k] * c;
-            acc_r += self.hist_r[base + k] * c;
+        for ((&c, &sl), &sr) in row.iter().zip(hl.iter()).zip(hr.iter()) {
+            // 最も古いサンプルから最新サンプルへ向けて畳み込む（境界チェック排除・SIMD自動ベクトル化対応）
+            acc_l += sl * c;
+            acc_r += sr * c;
         }
         (acc_l, acc_r)
     }

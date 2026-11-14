@@ -511,3 +511,208 @@ fn test_full_rtmps_tls_end_to_end_with_local_server() {
     let _ = events.lock().unwrap().len();
     let _ = PublisherEvent::Error(String::new());
 }
+
+#[derive(Clone, Copy)]
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn range_usize(&mut self, min: usize, max_inclusive: usize) -> usize {
+        if min >= max_inclusive {
+            return min;
+        }
+        let span = (max_inclusive - min) + 1;
+        min + (self.next_u64() as usize % span)
+    }
+
+    fn gen_ascii(&mut self, max_len: usize) -> String {
+        let len = self.range_usize(0, max_len);
+        let mut s = String::with_capacity(len);
+        for _ in 0..len {
+            let ch = (b'!' + (self.next_u64() as u8 % 90)) as char;
+            s.push(ch);
+        }
+        s
+    }
+
+    fn gen_amf0(&mut self, depth: usize) -> Amf0Value {
+        let choice = if depth >= 2 {
+            self.range_usize(0, 3)
+        } else {
+            self.range_usize(0, 5)
+        };
+        match choice {
+            0 => Amf0Value::Number((self.next_u64() as i64 as f64) * 1e-6),
+            1 => Amf0Value::Boolean((self.next_u64() & 1) == 1),
+            2 => Amf0Value::String(self.gen_ascii(48)),
+            3 => Amf0Value::Null,
+            4 => {
+                let n = self.range_usize(0, 5);
+                let mut pairs = Vec::with_capacity(n);
+                for k in 0..n {
+                    let key = format!("k{}_{}", k, self.gen_ascii(8));
+                    pairs.push((key, self.gen_amf0(depth + 1)));
+                }
+                Amf0Value::Object(pairs)
+            }
+            _ => {
+                let n = self.range_usize(0, 5);
+                let mut pairs = Vec::with_capacity(n);
+                for k in 0..n {
+                    let key = format!("e{}_{}", k, self.gen_ascii(8));
+                    pairs.push((key, self.gen_amf0(depth + 1)));
+                }
+                Amf0Value::EcmaArray(pairs)
+            }
+        }
+    }
+}
+
+#[test]
+fn test_property_amf0_arbitrary_roundtrip() {
+    let mut rng = SplitMix64(0xA3F0_1234_5678_9ABC);
+    for _ in 0..200 {
+        let count = rng.range_usize(1, 8);
+        let values: Vec<Amf0Value> = (0..count).map(|_| rng.gen_amf0(0)).collect();
+        let bytes = encode_values(&values);
+        let decoded = decode_all(&bytes).expect("AMF0 decode must succeed for valid encoded bytes");
+        assert_eq!(decoded, values);
+    }
+}
+
+#[test]
+fn test_property_chunk_stream_arbitrary_csids_sizes_and_extended_timestamps() {
+    let mut rng = SplitMix64(0xC40C_8765_4321_CAFE);
+
+    for trial in 0..40 {
+        let chunk_size = match trial % 5 {
+            0 => 1,
+            1 => 7,
+            2 => 128,
+            3 => 4096,
+            _ => rng.range_usize(16, 2048),
+        };
+        let mut writer = ChunkWriter::new();
+        let mut reader = ChunkReader::new();
+        writer.set_chunk_size(chunk_size);
+        reader.set_chunk_size(chunk_size);
+
+        let msg_count = rng.range_usize(8, 28);
+        let mut wire = Vec::new();
+        let mut expected = Vec::with_capacity(msg_count);
+
+        for m in 0..msg_count {
+            // CSID ranges: 2..=63 (1B), 64..=319 (2B), 320..=2000 (3B)
+            let csid = match rng.range_usize(0, 2) {
+                0 => rng.range_usize(2, 63) as u32,
+                1 => rng.range_usize(64, 319) as u32,
+                _ => rng.range_usize(320, 2000) as u32,
+            };
+            // Include extended timestamps (>= 0x00FF_FFFF) and zero-delta continuations
+            let ts = match m % 4 {
+                0 => rng.range_usize(0, 100_000) as u32,
+                1 => 0x00FF_FFFF + (rng.range_usize(0, 50_000) as u32),
+                2 => 0x0100_0000, // repeated extended timestamp (delta == 0)
+                _ => 0x0100_0000,
+            };
+            let payload_len = rng.range_usize(0, chunk_size * 3 + 19);
+            let payload: Vec<u8> = (0..payload_len)
+                .map(|_| (rng.next_u64() & 0xFF) as u8)
+                .collect();
+            let msg = RtmpMessage {
+                csid,
+                timestamp_ms: ts,
+                msg_type: if (m & 1) == 0 { MSG_VIDEO } else { MSG_AUDIO },
+                stream_id: 1,
+                payload,
+            };
+            writer.write_message(&mut wire, &msg).unwrap();
+            expected.push(msg);
+        }
+
+        let mut cursor = std::io::Cursor::new(wire);
+        for exp in &expected {
+            let got = reader.read_message(&mut cursor).unwrap();
+            assert_eq!(&got, exp);
+        }
+    }
+}
+
+#[test]
+fn test_property_annexb_to_avcc_and_abr_invariants() {
+    use core_rtmp::flv::{annexb_to_avcc, split_annexb_nalus};
+
+    let mut rng = SplitMix64(0x264A_B123_4567_8901);
+
+    // 1. スタートコード種別 (3-byte / 4-byte) と任意の非スタートコードNALU列の往復分解・AVCC変換不変条件
+    for _ in 0..100 {
+        let nalu_count = rng.range_usize(1, 8);
+        let mut expected_nalus: Vec<Vec<u8>> = Vec::with_capacity(nalu_count);
+        let mut annexb = Vec::new();
+
+        for idx in 0..nalu_count {
+            if (rng.next_u64() & 1) == 0 || idx == 0 {
+                annexb.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            } else {
+                annexb.extend_from_slice(&[0x00, 0x00, 0x01]);
+            }
+            let len = rng.range_usize(1, 256);
+            let mut nalu = Vec::with_capacity(len);
+            for _ in 0..len {
+                // Emulation prevention: avoid generating 00 00 01 or 00 00 00 inside payload
+                let b = (rng.range_usize(2, 255)) as u8;
+                nalu.push(b);
+            }
+            annexb.extend_from_slice(&nalu);
+            expected_nalus.push(nalu);
+        }
+
+        let split = split_annexb_nalus(&annexb);
+        assert_eq!(split.len(), expected_nalus.len());
+        for (got, exp) in split.iter().zip(expected_nalus.iter()) {
+            assert_eq!(*got, exp.as_slice());
+        }
+
+        let avcc = annexb_to_avcc(&annexb);
+        let mut pos = 0usize;
+        for exp in &expected_nalus {
+            let len = u32::from_be_bytes(avcc[pos..pos + 4].try_into().unwrap()) as usize;
+            assert_eq!(len, exp.len());
+            assert_eq!(&avcc[pos + 4..pos + 4 + len], exp.as_slice());
+            pos += 4 + len;
+        }
+        assert_eq!(pos, avcc.len());
+    }
+
+    // 2. AimdAbrController の任意のキュー変動・経過時間に対するビットレート境界不変条件
+    let cfg = AbrConfig {
+        initial_bitrate_bps: 3_000_000,
+        min_bitrate_bps: 500_000,
+        max_bitrate_bps: 6_000_000,
+        ..AbrConfig::default()
+    };
+    let mut abr = AimdAbrController::new(cfg.clone());
+    for _ in 0..1000 {
+        let q_bytes = rng.range_usize(0, 1_500_000);
+        let dt_ms = rng.range_usize(1, 1000) as u64;
+        let dec = abr.evaluate(q_bytes, dt_ms);
+        assert!(
+            dec.current_bitrate_bps >= cfg.min_bitrate_bps
+                && dec.current_bitrate_bps <= cfg.max_bitrate_bps,
+            "ABR bitrate {} out of [{}..={}]",
+            dec.current_bitrate_bps,
+            cfg.min_bitrate_bps,
+            cfg.max_bitrate_bps
+        );
+        if let Some(nb) = dec.new_bitrate_bps {
+            assert_eq!(nb, dec.current_bitrate_bps);
+        }
+    }
+}

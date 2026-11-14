@@ -71,6 +71,30 @@ impl StereoDelayLine {
     pub fn process_in_place(&mut self, interleaved_pcm: &mut [f32]) {
         debug_assert_eq!(interleaved_pcm.len() % 2, 0);
 
+        if self.crossfade_pos >= self.crossfade_len {
+            let delay = self.current_delay_frames;
+            if delay == 0 {
+                for frame in interleaved_pcm.chunks_exact(2) {
+                    let w_base = self.write_pos * 2;
+                    self.buffer[w_base] = frame[0];
+                    self.buffer[w_base + 1] = frame[1];
+                    self.write_pos = (self.write_pos + 1) & self.mask;
+                }
+            } else {
+                for frame in interleaved_pcm.chunks_exact_mut(2) {
+                    let w_base = self.write_pos * 2;
+                    self.buffer[w_base] = frame[0];
+                    self.buffer[w_base + 1] = frame[1];
+                    let (out_l, out_r) = self.read_delayed(delay);
+                    frame[0] = out_l;
+                    frame[1] = out_r;
+                    self.write_pos = (self.write_pos + 1) & self.mask;
+                }
+            }
+            return;
+        }
+
+        let inv_cf_len = 1.0 / self.crossfade_len as f32;
         for frame in interleaved_pcm.chunks_exact_mut(2) {
             let w_base = self.write_pos * 2;
             self.buffer[w_base] = frame[0];
@@ -79,7 +103,7 @@ impl StereoDelayLine {
             let (out_l, out_r) = if self.crossfade_pos < self.crossfade_len {
                 let (old_l, old_r) = self.read_delayed(self.prev_delay_frames);
                 let (new_l, new_r) = self.read_delayed(self.target_delay_frames);
-                let alpha = (self.crossfade_pos + 1) as f32 / self.crossfade_len as f32;
+                let alpha = (self.crossfade_pos + 1) as f32 * inv_cf_len;
                 let inv = 1.0 - alpha;
                 self.crossfade_pos += 1;
                 if self.crossfade_pos >= self.crossfade_len {

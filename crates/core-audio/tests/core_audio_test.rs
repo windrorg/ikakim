@@ -147,3 +147,169 @@ fn test_soft_clipper_bounds_and_master_clock_advance() {
     }
     assert_eq!(clock.now_samples().as_samples(), MASTER_SAMPLE_RATE);
 }
+
+#[derive(Clone, Copy)]
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn next_f32_signed(&mut self) -> f32 {
+        let u = (self.next_u64() >> 40) as f32 / ((1u64 << 24) as f32);
+        u * 2.0 - 1.0
+    }
+
+    fn range_u32(&mut self, min: u32, max_inclusive: u32) -> u32 {
+        if min >= max_inclusive {
+            return min;
+        }
+        let span = (max_inclusive - min) + 1;
+        min + (self.next_u64() as u32 % span)
+    }
+}
+
+#[test]
+fn test_property_soft_clip_monotonicity_symmetry_and_bounds() {
+    let mut rng = SplitMix64(0xA0D1_0BEE_F123_4567);
+    for _ in 0..2000 {
+        let a = rng.next_f32_signed() * 20.0;
+        let b = rng.next_f32_signed() * 20.0;
+        let (x1, x2) = if a <= b { (a, b) } else { (b, a) };
+
+        let y1 = soft_clip(x1);
+        let y2 = soft_clip(x2);
+
+        // 1. 境界性: 出力は常に [-1.0, 1.0] の範囲内かつ有限
+        assert!(y1.is_finite() && (-1.0..=1.0).contains(&y1));
+        assert!(y2.is_finite() && (-1.0..=1.0).contains(&y2));
+
+        // 2. 広義単調増加性: x1 <= x2 => soft_clip(x1) <= soft_clip(x2)
+        assert!(
+            y1 <= y2 + 1e-6,
+            "monotonicity violated: soft_clip({x1})={y1} > soft_clip({x2})={y2}"
+        );
+
+        // 3. 奇関数対称性: soft_clip(-x) == -soft_clip(x)
+        let yn = soft_clip(-x1);
+        assert!(
+            (yn + y1).abs() < 1e-6,
+            "odd symmetry violated: soft_clip({x1})={y1}, soft_clip({})={yn}",
+            -x1
+        );
+
+        // 4. 線形領域不変性: |x| <= 0.85 では恒等写像
+        if x1.abs() <= 0.85 {
+            assert!((y1 - x1).abs() < 1e-6);
+        }
+    }
+}
+
+#[test]
+fn test_property_stereo_delay_line_dynamic_jumps_and_impulse_accuracy() {
+    use core_audio::delay::StereoDelayLine;
+
+    let mut rng = SplitMix64(0xDE1A_7123_9876_5432);
+    let mut delay = StereoDelayLine::new(0);
+    let mut block = vec![0.0f32; 256 * 2];
+
+    // 1. ランダムな遅延時間ジャンプ（0..=1200ms、上限1000msクランプ含む）とランダム入力に対する有界安定性
+    for _ in 0..250 {
+        let target_ms = rng.range_u32(0, 1200);
+        delay.set_delay_ms(target_ms);
+        assert!(delay.target_delay_ms() <= 1000);
+
+        for s in &mut block {
+            *s = rng.next_f32_signed();
+        }
+        delay.process_in_place(&mut block);
+        for &s in &block {
+            assert!(
+                s.is_finite() && s.abs() <= 1.0001,
+                "delay output out of bounds: {s}"
+            );
+        }
+    }
+
+    // 2. 任意の遅延設定 (0, 5, 17, 50ms) においてクロスフェード完了後にインパルスが正確に N*48 フレーム遅れて出力される性質
+    for &ms in &[0u32, 5, 17, 50] {
+        delay.clear();
+        delay.set_delay_ms(ms);
+        // クロスフェード完了まで無音を通す
+        let mut warmup = vec![0.0f32; 512 * 2];
+        delay.process_in_place(&mut warmup);
+
+        let expected_frames = (ms as usize) * 48;
+        let total_frames = expected_frames + 32;
+        let mut sig = vec![0.0f32; total_frames * 2];
+        sig[0] = 0.75;
+        sig[1] = -0.5;
+        delay.process_in_place(&mut sig);
+
+        for f in 0..total_frames {
+            let l = sig[f * 2];
+            let r = sig[f * 2 + 1];
+            if f == expected_frames {
+                assert!((l - 0.75).abs() < 1e-6 && (r - (-0.5)).abs() < 1e-6);
+            } else {
+                assert!(l.abs() < 1e-6 && r.abs() < 1e-6);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_property_resampler_arbitrary_rates_and_chunk_sizes() {
+    use core_audio::resampler::PolyphaseResampler;
+
+    let mut rng = SplitMix64(0x4800_0441_0096_0000);
+    let sample_rates = [16_000u32, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000];
+
+    for &src_rate in &sample_rates {
+        for &channels in &[1usize, 2usize] {
+            let mut resampler = PolyphaseResampler::new(src_rate, channels);
+            let total_in_frames = (src_rate as usize) / 2; // 0.5 秒相当
+            let mut remaining = total_in_frames;
+            let mut frame_cursor = 0usize;
+            let mut out = Vec::new();
+            let mut total_out_samples = 0usize;
+
+            while remaining > 0 {
+                let chunk_frames = (rng.range_u32(1, 512) as usize).min(remaining);
+                remaining -= chunk_frames;
+                let mut input = Vec::with_capacity(chunk_frames * channels);
+                for _ in 0..chunk_frames {
+                    let v = (2.0 * std::f32::consts::PI * 440.0 * (frame_cursor as f32)
+                        / (src_rate as f32))
+                        .sin()
+                        * 0.5;
+                    frame_cursor += 1;
+                    input.push(v);
+                    if channels == 2 {
+                        input.push(v);
+                    }
+                }
+                out.clear();
+                let written = resampler.process(&input, &mut out);
+                assert_eq!(written, out.len());
+                assert_eq!(written % 2, 0);
+                for &s in &out {
+                    assert!(s.is_finite() && s.abs() < 0.65);
+                }
+                total_out_samples += written;
+            }
+
+            let total_out_frames = total_out_samples / 2;
+            // 0.5秒 = 24,000 フレーム (48kHz) に対してフィルタ群遅延分以内の誤差で収束する性質
+            assert!(
+                total_out_frames.abs_diff(24_000) <= 32,
+                "src_rate={src_rate}, ch={channels}: got {total_out_frames} frames, expected ~24000"
+            );
+        }
+    }
+}

@@ -354,7 +354,7 @@ impl IkakimEngineHandle {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let apple_importer = AppleMetalZeroCopyImporter::new(&gpu_ctx.device).ok();
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let apple_main_pool = apple_importer.as_ref().and_then(|imp| {
+        let mut apple_main_pool = apple_importer.as_ref().and_then(|imp| {
             AppleZeroCopyRenderSurfacePool::new(imp, &gpu_ctx.device, main_w, main_h, 6).ok()
         });
         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -372,6 +372,10 @@ impl IkakimEngineHandle {
                 target_fps: fps,
             },
         );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(ref mut pool) = apple_main_pool {
+            pool.prebind_preview_blit(&compositor);
+        }
 
         let main_encoder = PlatformVideoEncoder::new(main_w, main_h, fps, initial_bitrate);
         let preview_encoder = PlatformVideoEncoder::new(prev_w, prev_h, fps.min(30), 1_000_000);
@@ -707,6 +711,17 @@ pub unsafe extern "C" fn ikakim_engine_submit_cv_pixel_buffer(
                 Ok(pb) => pb,
                 Err(e) => return eng.set_err(e.to_string()),
             };
+            if let Some(StoredLayer::AppleZeroCopy(existing)) =
+                eng.layers.get_mut(&(layer_id as usize))
+            {
+                return match importer.update_gpu_layer(&eng.compositor, existing, &pb) {
+                    Ok(()) => {
+                        eng.apple_zero_copy_active = true;
+                        0
+                    }
+                    Err(e) => eng.set_err(e.to_string()),
+                };
+            }
             let transform = eng
                 .layers
                 .get(&(layer_id as usize))

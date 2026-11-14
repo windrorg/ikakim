@@ -348,6 +348,7 @@ fn test_gpu_compositor_1080p60_external_bgra_zero_readback_targets() {
         .unwrap();
 
     // Warmup + measure steady-state 1080p60 render_dual_into (skipped on CPU software rasterizers)
+    let ext_main_blit_bg = comp.create_preview_blit_bind_group(&ext_main_view);
     let measure_frames = if is_sw_rasterizer { 4u64 } else { 30u64 };
     for w in 0..3u64 {
         comp.render_dual_into(
@@ -357,11 +358,13 @@ fn test_gpu_compositor_1080p60_external_bgra_zero_readback_targets() {
                 view: &ext_main_view,
                 format: ExternalRenderFormat::Bgra8Unorm,
                 readable_for_preview_blit: true,
+                preview_blit_bind_group: Some(&ext_main_blit_bg),
             }),
             Some(ExternalRenderTarget {
                 view: &ext_prev_view,
                 format: ExternalRenderFormat::Bgra8Unorm,
                 readable_for_preview_blit: false,
+                preview_blit_bind_group: None,
             }),
         )
         .unwrap();
@@ -377,11 +380,13 @@ fn test_gpu_compositor_1080p60_external_bgra_zero_readback_targets() {
                     view: &ext_main_view,
                     format: ExternalRenderFormat::Bgra8Unorm,
                     readable_for_preview_blit: true,
+                    preview_blit_bind_group: Some(&ext_main_blit_bg),
                 }),
                 Some(ExternalRenderTarget {
                     view: &ext_prev_view,
                     format: ExternalRenderFormat::Bgra8Unorm,
                     readable_for_preview_blit: false,
+                    preview_blit_bind_group: None,
                 }),
             )
             .unwrap();
@@ -414,4 +419,41 @@ fn test_gpu_compositor_1080p60_external_bgra_zero_readback_targets() {
         "540p preview BGRA top-right blit expected R>200, B<50, got BGRA={:?}",
         &prev_bgra[tr_prev..tr_prev + 4]
     );
+}
+
+#[test]
+fn test_property_overlay_governor_hysteresis_and_bounds() {
+    let mut seed = 0x600D_607E_1234_5678u64;
+    let mut next_u64 = || {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+
+    for max_sampled in [4u32, 8, 12, 16, 32] {
+        let budget_us = 16_666u64;
+        let mut gov = OverlayGovernor::from_limits(max_sampled, budget_us);
+        let hw_cap = gov.hardware_cap();
+        assert!((1..=16).contains(&hw_cap));
+
+        for _ in 0..500 {
+            let prev_cap = gov.current_cap();
+            let frame_us = next_u64() % 35_000;
+            gov.record_frame_time(frame_us);
+            let new_cap = gov.current_cap();
+
+            // 1. 境界不変条件: 1 <= current_cap <= hardware_cap
+            assert!(
+                (1..=hw_cap).contains(&new_cap),
+                "cap {new_cap} out of 1..={hw_cap}"
+            );
+            // 2. 連続性不変条件: 1フレームあたりの変化量は高々 ±1
+            assert!(
+                prev_cap.abs_diff(new_cap) <= 1,
+                "cap jumped more than 1 step: {prev_cap} -> {new_cap}"
+            );
+        }
+    }
 }

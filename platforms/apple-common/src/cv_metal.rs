@@ -365,6 +365,7 @@ pub struct AppleZeroCopyRenderSlot {
     pub pixel_buffer: CVPixelBufferWrapper,
     iosurface: *const c_void,
     mtl_iosurface: *const c_void,
+    preview_blit_bg: Option<wgpu::BindGroup>,
 }
 
 unsafe impl Send for AppleZeroCopyRenderSlot {}
@@ -376,6 +377,7 @@ impl AppleZeroCopyRenderSlot {
             view: &self.view,
             format: ExternalRenderFormat::Bgra8Unorm,
             readable_for_preview_blit: true,
+            preview_blit_bind_group: self.preview_blit_bg.as_ref(),
         }
     }
 
@@ -467,7 +469,17 @@ impl AppleZeroCopyRenderSurfacePool {
             pixel_buffer: pb,
             iosurface,
             mtl_iosurface,
+            preview_blit_bg: None,
         })
+    }
+
+    /// プール内の全スロットにプレビュー縮小ブリット用 `BindGroup` を事前生成してキャッシュする
+    pub fn prebind_preview_blit(&mut self, comp: &GpuCompositor) {
+        for slot in &mut self.slots {
+            if slot.preview_blit_bg.is_none() {
+                slot.preview_blit_bg = Some(comp.create_preview_blit_bind_group(&slot.view));
+            }
+        }
     }
 
     /// VideoToolbox 側で未参照 (`retain_count == 1`) のスロットをゼロコピー再利用する
@@ -698,6 +710,29 @@ impl AppleMetalZeroCopyImporter {
             cv_tex0,
             cv_tex1,
         })
+    }
+
+    /// 既存の `ImportedGpuLayer` の GPU Uniform バッファを再利用したまま新しい `CVPixelBuffer` へゼロコピー差し替えする
+    pub fn update_gpu_layer(
+        &self,
+        comp: &GpuCompositor,
+        imported: &mut ImportedGpuLayer,
+        pb: &CVPixelBufferWrapper,
+    ) -> CoreResult<()> {
+        let (_kind, _width, _height, tex0, tex1, cv_tex0, cv_tex1) =
+            self.import_raw_planes(&comp.context().device, pb.raw())?;
+        comp.update_layer_textures(&mut imported.layer, tex0, tex1);
+        unsafe {
+            if !imported.cv_tex0.is_null() {
+                CFRelease(imported.cv_tex0 as CFTypeRef);
+            }
+            if !imported.cv_tex1.is_null() {
+                CFRelease(imported.cv_tex1 as CFTypeRef);
+            }
+        }
+        imported.cv_tex0 = cv_tex0;
+        imported.cv_tex1 = cv_tex1;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

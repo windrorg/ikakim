@@ -343,3 +343,171 @@ fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
     s.read_to_string(&mut buf).unwrap();
     buf
 }
+
+#[derive(Clone, Copy)]
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn range_usize(&mut self, min: usize, max_inclusive: usize) -> usize {
+        if min >= max_inclusive {
+            return min;
+        }
+        let span = (max_inclusive - min) + 1;
+        min + (self.next_u64() as usize % span)
+    }
+
+    fn gen_json_string(&mut self) -> String {
+        const POOL: &[char] = &[
+            'a', 'Z', '0', '9', '_', '-', ' ', '"', '\\', '/', '\n', '\r', '\t', 'あ', '配', '信',
+        ];
+        let len = self.range_usize(0, 24);
+        let mut out = String::with_capacity(len);
+        for _ in 0..len {
+            out.push(POOL[self.range_usize(0, POOL.len() - 1)]);
+        }
+        out
+    }
+
+    fn gen_json(&mut self, depth: usize) -> core_net_ui::json::JsonValue {
+        use core_net_ui::json::JsonValue;
+        let kind = if depth >= 2 {
+            self.range_usize(0, 3)
+        } else {
+            self.range_usize(0, 5)
+        };
+        match kind {
+            0 => JsonValue::Null,
+            1 => JsonValue::Bool((self.next_u64() & 1) == 1),
+            2 => JsonValue::Number((self.next_u64() % 1_000_000) as f64 - 500_000.0),
+            3 => JsonValue::String(self.gen_json_string()),
+            4 => {
+                let n = self.range_usize(0, 5);
+                JsonValue::Array((0..n).map(|_| self.gen_json(depth + 1)).collect())
+            }
+            _ => {
+                let n = self.range_usize(0, 5);
+                let mut pairs = Vec::with_capacity(n);
+                for k in 0..n {
+                    pairs.push((format!("k{}_{}", k, self.range_usize(0, 99)), self.gen_json(depth + 1)));
+                }
+                JsonValue::Object(pairs)
+            }
+        }
+    }
+}
+
+#[test]
+fn test_property_json_roundtrip_and_escaping() {
+    use core_net_ui::json::parse_json;
+
+    let mut rng = SplitMix64(0x750A_BEEF_1234_5678);
+    for _ in 0..250 {
+        let val = rng.gen_json(0);
+        let text = val.to_json_string();
+        let parsed = parse_json(&text).expect("generated JSON must parse cleanly");
+        assert_eq!(parsed, val);
+    }
+}
+
+#[test]
+fn test_property_ws_framing_and_fmp4_box_integrity() {
+    use core_net_ui::ws::write_server_frame;
+
+    let mut rng = SplitMix64(0xF394_8765_4321_ABCD);
+
+    // 1. WebSocket フレーミング: 7bit (<126B), 16bit (126..=65535B), 64bit (>65535B) 全領域往復不変条件
+    let test_lengths = [0usize, 1, 63, 125, 126, 127, 512, 4096, 65_535, 65_536, 70_000];
+    for &len in &test_lengths {
+        let payload: Vec<u8> = (0..len).map(|_| (rng.next_u64() & 0xFF) as u8).collect();
+        let mask = [
+            (rng.next_u64() & 0xFF) as u8,
+            ((rng.next_u64() >> 8) & 0xFF) as u8,
+            ((rng.next_u64() >> 16) & 0xFF) as u8,
+            ((rng.next_u64() >> 24) & 0xFF) as u8,
+        ];
+
+        let mut wire = Vec::with_capacity(len + 16);
+        write_masked_frame(&mut wire, WsOpcode::Binary, &payload, mask).unwrap();
+        let mut cursor = std::io::Cursor::new(wire);
+        let msg = read_ws_message(&mut cursor).unwrap();
+        assert_eq!(msg, WsMessage::Binary(payload.clone()));
+
+        let mut srv_wire = Vec::with_capacity(len + 16);
+        write_server_frame(&mut srv_wire, WsOpcode::Binary, &payload).unwrap();
+        let mut srv_cursor = std::io::Cursor::new(srv_wire);
+        let srv_msg = read_ws_message(&mut srv_cursor).unwrap();
+        assert_eq!(srv_msg, WsMessage::Binary(payload));
+    }
+
+    // 2. fMP4 Muxer: 任意のサイズ・枚数の H.264 + AAC パケット列に対する ISO-BMFF ボックス長整合性
+    let mut muxer = Fmp4Muxer::new();
+    let seq_hdr = EncodedPacket {
+        codec: CodecKind::H264,
+        pts: PtsUs(0),
+        dts: PtsUs(0),
+        is_keyframe: true,
+        is_sequence_header: true,
+        data: vec![
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40, 0x50, 0x05, 0xBB,
+            0x01, 0x10, 0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80,
+        ],
+    };
+    let init = muxer.push_packet(&seq_hdr, 1280, 720, 60).unwrap().unwrap();
+    assert!(init.is_init);
+    assert_eq!(inspect_box_types(&init.bytes), vec![*b"ftyp", *b"moov"]);
+
+    let aac_seq = EncodedPacket {
+        codec: CodecKind::AacLc,
+        pts: PtsUs(0),
+        dts: PtsUs(0),
+        is_keyframe: true,
+        is_sequence_header: true,
+        data: vec![0x11, 0x90],
+    };
+    let init2 = muxer.push_packet(&aac_seq, 1280, 720, 60).unwrap().unwrap();
+    assert!(init2.is_init);
+
+    let mut pts_us = 0u64;
+    for f in 0..50 {
+        let aac_count = rng.range_usize(0, 3);
+        for _ in 0..aac_count {
+            let a_len = rng.range_usize(16, 256);
+            let a_pkt = EncodedPacket {
+                codec: CodecKind::AacLc,
+                pts: PtsUs(pts_us),
+                dts: PtsUs(pts_us),
+                is_keyframe: true,
+                is_sequence_header: false,
+                data: vec![0xAA; a_len],
+            };
+            assert!(muxer.push_packet(&a_pkt, 1280, 720, 60).unwrap().is_none());
+        }
+
+        let v_len = rng.range_usize(32, 4096);
+        let is_key = f == 0 || (f % 15 == 0);
+        let mut v_data = vec![0x00, 0x00, 0x00, 0x01, if is_key { 0x65 } else { 0x41 }];
+        v_data.extend(std::iter::repeat(0x5A).take(v_len));
+        let v_pkt = EncodedPacket {
+            codec: CodecKind::H264,
+            pts: PtsUs(pts_us),
+            dts: PtsUs(pts_us),
+            is_keyframe: is_key,
+            is_sequence_header: false,
+            data: v_data,
+        };
+        let seg = muxer.push_packet(&v_pkt, 1280, 720, 60).unwrap().unwrap();
+        assert!(!seg.is_init);
+        assert_eq!(seg.contains_keyframe, is_key);
+        assert_eq!(seg.sequence_number, (f + 1) as u32);
+        assert_eq!(inspect_box_types(&seg.bytes), vec![*b"moof", *b"mdat"]);
+        pts_us += 16_667;
+    }
+}

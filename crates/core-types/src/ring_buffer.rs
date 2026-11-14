@@ -39,11 +39,13 @@ impl<T> Drop for RingBufferInner<T> {
 /// 書き込み側ハンドル（Producer スレッド専用）
 pub struct SpscProducer<T> {
     inner: Arc<RingBufferInner<T>>,
+    cached_head: usize,
 }
 
 /// 読み出し側ハンドル（Consumer スレッド専用）
 pub struct SpscConsumer<T> {
     inner: Arc<RingBufferInner<T>>,
+    cached_tail: usize,
 }
 
 /// 指定された最小容量以上の 2 のべき乗サイズで SPSC リングバッファを生成する
@@ -67,8 +69,12 @@ pub fn spsc_channel<T>(min_capacity: usize) -> (SpscProducer<T>, SpscConsumer<T>
     (
         SpscProducer {
             inner: Arc::clone(&inner),
+            cached_head: 0,
         },
-        SpscConsumer { inner },
+        SpscConsumer {
+            inner,
+            cached_tail: 0,
+        },
     )
 }
 
@@ -90,9 +96,11 @@ impl<T> SpscProducer<T> {
     #[inline]
     pub fn try_push(&mut self, item: T) -> Result<(), T> {
         let tail = self.inner.tail.0.load(Ordering::Relaxed);
-        let head = self.inner.head.0.load(Ordering::Acquire);
-        if tail.wrapping_sub(head) == self.inner.capacity {
-            return Err(item);
+        if tail.wrapping_sub(self.cached_head) == self.inner.capacity {
+            self.cached_head = self.inner.head.0.load(Ordering::Acquire);
+            if tail.wrapping_sub(self.cached_head) == self.inner.capacity {
+                return Err(item);
+            }
         }
         let slot = tail & self.inner.mask;
         unsafe {
@@ -109,9 +117,15 @@ impl<T> SpscProducer<T> {
 impl<T: Copy> SpscProducer<T> {
     /// 音声PCMサンプル等のスライスを一括書き込みし、書き込めた要素数を返す
     pub fn push_slice(&mut self, items: &[T]) -> usize {
+        if items.is_empty() {
+            return 0;
+        }
         let tail = self.inner.tail.0.load(Ordering::Relaxed);
-        let head = self.inner.head.0.load(Ordering::Acquire);
-        let free = self.inner.capacity - tail.wrapping_sub(head);
+        let mut free = self.inner.capacity - tail.wrapping_sub(self.cached_head);
+        if free < items.len() {
+            self.cached_head = self.inner.head.0.load(Ordering::Acquire);
+            free = self.inner.capacity - tail.wrapping_sub(self.cached_head);
+        }
         let count = items.len().min(free);
         if count == 0 {
             return 0;
@@ -149,9 +163,11 @@ impl<T> SpscConsumer<T> {
     #[inline]
     pub fn try_pop(&mut self) -> Option<T> {
         let head = self.inner.head.0.load(Ordering::Relaxed);
-        let tail = self.inner.tail.0.load(Ordering::Acquire);
-        if head == tail {
-            return None;
+        if head == self.cached_tail {
+            self.cached_tail = self.inner.tail.0.load(Ordering::Acquire);
+            if head == self.cached_tail {
+                return None;
+            }
         }
         let slot = head & self.inner.mask;
         let item = unsafe { (*self.inner.buffer[slot].get()).assume_init_read() };
@@ -162,22 +178,56 @@ impl<T> SpscConsumer<T> {
         Some(item)
     }
 
-    /// 溜まっている古い要素を破棄して最新状態へ追いつく（遅延リカバリ用）
-    pub fn drain_all(&mut self) -> usize {
-        let mut dropped = 0;
-        while self.try_pop().is_some() {
-            dropped += 1;
+    /// 指定した最大個数まで古い要素を一括破棄し、破棄した要素数を返す
+    #[inline]
+    pub fn discard(&mut self, max_count: usize) -> usize {
+        if max_count == 0 {
+            return 0;
         }
-        dropped
+        let head = self.inner.head.0.load(Ordering::Relaxed);
+        let mut avail = self.cached_tail.wrapping_sub(head);
+        if avail < max_count {
+            self.cached_tail = self.inner.tail.0.load(Ordering::Acquire);
+            avail = self.cached_tail.wrapping_sub(head);
+        }
+        let count = max_count.min(avail);
+        if count == 0 {
+            return 0;
+        }
+        if std::mem::needs_drop::<T>() {
+            for i in 0..count {
+                let slot = head.wrapping_add(i) & self.inner.mask;
+                unsafe {
+                    (*self.inner.buffer[slot].get()).assume_init_drop();
+                }
+            }
+        }
+        self.inner
+            .head
+            .0
+            .store(head.wrapping_add(count), Ordering::Release);
+        count
+    }
+
+    /// 溜まっている古い要素を破棄して最新状態へ追いつく（遅延リカバリ用）
+    #[inline]
+    pub fn drain_all(&mut self) -> usize {
+        self.discard(usize::MAX)
     }
 }
 
 impl<T: Copy> SpscConsumer<T> {
     /// 音声PCMサンプル等をバッファへ一括読み出しし、読み出せた要素数を返す
     pub fn pop_slice(&mut self, out: &mut [T]) -> usize {
+        if out.is_empty() {
+            return 0;
+        }
         let head = self.inner.head.0.load(Ordering::Relaxed);
-        let tail = self.inner.tail.0.load(Ordering::Acquire);
-        let avail = tail.wrapping_sub(head);
+        let mut avail = self.cached_tail.wrapping_sub(head);
+        if avail < out.len() {
+            self.cached_tail = self.inner.tail.0.load(Ordering::Acquire);
+            avail = self.cached_tail.wrapping_sub(head);
+        }
         let count = out.len().min(avail);
         if count == 0 {
             return 0;

@@ -608,9 +608,10 @@ impl AppleSrsHarness {
                 target_fps: fps,
             },
         );
-        let main_pool =
+        let mut main_pool =
             AppleZeroCopyRenderSurfacePool::new(&importer, &comp.context().device, width, height, 6)
                 .expect("main AppleZeroCopyRenderSurfacePool");
+        main_pool.prebind_preview_blit(&comp);
         let prev_pool = AppleZeroCopyRenderSurfacePool::new(
             &importer,
             &comp.context().device,
@@ -1285,18 +1286,25 @@ fn test_srs_e2e_duplicate_stream_key_conflict_and_takeover() {
     secondary.bridge.start_stream(&url, None).unwrap();
 
     let mut s_idx = 0u64;
-    for _ in 0..15 {
+    let reject_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < reject_deadline {
         primary.step(p_idx, false);
         p_idx += 1;
         secondary.step(s_idx, false);
         s_idx += 1;
-        thread::sleep(Duration::from_millis(33));
+        if secondary.bridge.snapshot().state != PipelineState::Streaming
+            && secondary.bridge.last_error().is_some()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
     }
     assert_eq!(primary.bridge.snapshot().state, PipelineState::Streaming);
     assert_ne!(
         secondary.bridge.snapshot().state,
         PipelineState::Streaming,
-        "secondary publisher should be rejected while primary holds the SRS stream key"
+        "secondary publisher should be rejected while primary holds the SRS stream key (err={:?})",
+        secondary.bridge.last_error()
     );
 
     // Stop primary -> secondary must automatically take over the stream key cleanly

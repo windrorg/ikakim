@@ -201,6 +201,9 @@ impl Fmp4Muxer {
                         1024
                     };
                     self.last_audio_pts_us = Some(packet.pts.0);
+                    if self.pending_audio.len() >= 128 {
+                        self.pending_audio.drain(0..64);
+                    }
                     self.pending_audio.push(QueuedSample {
                         pts_90k_or_48k: pts_ticks,
                         duration: dur_ticks,

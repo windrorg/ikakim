@@ -184,14 +184,8 @@ impl AudioInputProducer {
         self.producer.push_slice(&self.scratch_48k)
     }
 
-    /// S16_LE 整数PCM（ALSA等）を f32 [-1.0, 1.0] に正規化して投入する
-    pub fn push_i16(&mut self, interleaved_i16: &[i16]) -> usize {
-        self.scratch_f32.clear();
-        self.scratch_f32.reserve(interleaved_i16.len());
-        const INV_I16: f32 = 1.0 / 32768.0;
-        for &s in interleaved_i16 {
-            self.scratch_f32.push(s as f32 * INV_I16);
-        }
+    #[inline]
+    fn push_scratch_f32(&mut self) -> usize {
         if self.resampler.is_passthrough() {
             let valid = (self.scratch_f32.len() / 2) * 2;
             self.producer.push_slice(&self.scratch_f32[..valid])
@@ -203,6 +197,17 @@ impl AudioInputProducer {
         }
     }
 
+    /// S16_LE 整数PCM（ALSA等）を f32 [-1.0, 1.0] に正規化して投入する
+    pub fn push_i16(&mut self, interleaved_i16: &[i16]) -> usize {
+        self.scratch_f32.clear();
+        self.scratch_f32.reserve(interleaved_i16.len());
+        const INV_I16: f32 = 1.0 / 32768.0;
+        for &s in interleaved_i16 {
+            self.scratch_f32.push(s as f32 * INV_I16);
+        }
+        self.push_scratch_f32()
+    }
+
     /// S32_LE 整数PCM（ALSAプロ向け等）を f32 [-1.0, 1.0] に正規化して投入する
     pub fn push_i32(&mut self, interleaved_i32: &[i32]) -> usize {
         self.scratch_f32.clear();
@@ -211,15 +216,7 @@ impl AudioInputProducer {
         for &s in interleaved_i32 {
             self.scratch_f32.push(s as f32 * INV_I32);
         }
-        if self.resampler.is_passthrough() {
-            let valid = (self.scratch_f32.len() / 2) * 2;
-            self.producer.push_slice(&self.scratch_f32[..valid])
-        } else {
-            self.scratch_48k.clear();
-            self.resampler
-                .process(&self.scratch_f32, &mut self.scratch_48k);
-            self.producer.push_slice(&self.scratch_48k)
-        }
+        self.push_scratch_f32()
     }
 
     pub fn available_write_samples(&self) -> usize {
@@ -380,14 +377,11 @@ impl AudioMixer {
             }
             let buf = &mut ch.scratch[..sample_count];
 
-            // 遅延蓄積が上限を超えている場合は古いサンプルを破棄してリアルタイム性を維持
+            // 遅延蓄積が上限を超えている場合は古いサンプルを一括破棄してリアルタイム性を維持
             let avail = ch.consumer.available_read();
             if avail > self.max_input_backlog_samples {
                 let excess = ((avail - sample_count) / 2) * 2;
-                let mut discarded = 0;
-                while discarded < excess && ch.consumer.try_pop().is_some() {
-                    discarded += 1;
-                }
+                ch.consumer.discard(excess);
             }
 
             let read = ch.consumer.pop_slice(buf);

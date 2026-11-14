@@ -21,7 +21,7 @@ pub const CSID_AUDIO: u32 = 4;
 pub const CSID_VIDEO: u32 = 6;
 pub const CSID_DATA: u32 = 5;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtmpMessage {
     pub csid: u32,
     pub timestamp_ms: u32,
@@ -33,7 +33,6 @@ pub struct RtmpMessage {
 #[derive(Debug, Clone)]
 struct OutPrevHeader {
     timestamp_ms: u32,
-    timestamp_delta: u32,
     stream_id: u32,
 }
 
@@ -62,10 +61,12 @@ impl ChunkWriter {
         let payload_len = msg.payload.len() as u32;
         let mut total_written = 0usize;
         let mut offset = 0usize;
+        let mut msg_ext_ts: Option<u32> = None;
 
         while offset < msg.payload.len() || (msg.payload.is_empty() && offset == 0) {
             let chunk_len = (msg.payload.len() - offset).min(self.chunk_size);
-            let mut hdr = Vec::with_capacity(18);
+            let mut hdr = [0u8; 18];
+            let mut hdr_len: usize;
 
             if offset == 0 {
                 // Fmt 0 または Fmt 1 で送信
@@ -78,64 +79,62 @@ impl ChunkWriter {
                 if use_fmt1 {
                     let prev = &self.prev_headers[&msg.csid];
                     let delta = msg.timestamp_ms.wrapping_sub(prev.timestamp_ms);
-                    encode_basic_header(1, msg.csid, &mut hdr);
+                    hdr_len = encode_basic_header_buf(1, msg.csid, &mut hdr);
                     let ts_field = if delta >= 0x00FF_FFFF { 0x00FF_FFFF } else { delta };
-                    hdr.extend_from_slice(&ts_field.to_be_bytes()[1..4]);
-                    hdr.extend_from_slice(&payload_len.to_be_bytes()[1..4]);
-                    hdr.push(msg.msg_type);
+                    hdr[hdr_len..hdr_len + 3].copy_from_slice(&ts_field.to_be_bytes()[1..4]);
+                    hdr[hdr_len + 3..hdr_len + 6].copy_from_slice(&payload_len.to_be_bytes()[1..4]);
+                    hdr[hdr_len + 6] = msg.msg_type;
+                    hdr_len += 7;
                     if delta >= 0x00FF_FFFF {
-                        hdr.extend_from_slice(&delta.to_be_bytes());
+                        hdr[hdr_len..hdr_len + 4].copy_from_slice(&delta.to_be_bytes());
+                        hdr_len += 4;
+                        msg_ext_ts = Some(delta);
                     }
                     self.prev_headers.insert(
                         msg.csid,
                         OutPrevHeader {
                             timestamp_ms: msg.timestamp_ms,
-                            timestamp_delta: delta,
                             stream_id: msg.stream_id,
                         },
                     );
                 } else {
-                    encode_basic_header(0, msg.csid, &mut hdr);
+                    hdr_len = encode_basic_header_buf(0, msg.csid, &mut hdr);
                     let ts_field = if msg.timestamp_ms >= 0x00FF_FFFF {
                         0x00FF_FFFF
                     } else {
                         msg.timestamp_ms
                     };
-                    hdr.extend_from_slice(&ts_field.to_be_bytes()[1..4]);
-                    hdr.extend_from_slice(&payload_len.to_be_bytes()[1..4]);
-                    hdr.push(msg.msg_type);
-                    hdr.extend_from_slice(&msg.stream_id.to_le_bytes());
+                    hdr[hdr_len..hdr_len + 3].copy_from_slice(&ts_field.to_be_bytes()[1..4]);
+                    hdr[hdr_len + 3..hdr_len + 6].copy_from_slice(&payload_len.to_be_bytes()[1..4]);
+                    hdr[hdr_len + 6] = msg.msg_type;
+                    hdr[hdr_len + 7..hdr_len + 11].copy_from_slice(&msg.stream_id.to_le_bytes());
+                    hdr_len += 11;
                     if msg.timestamp_ms >= 0x00FF_FFFF {
-                        hdr.extend_from_slice(&msg.timestamp_ms.to_be_bytes());
+                        hdr[hdr_len..hdr_len + 4].copy_from_slice(&msg.timestamp_ms.to_be_bytes());
+                        hdr_len += 4;
+                        msg_ext_ts = Some(msg.timestamp_ms);
                     }
                     self.prev_headers.insert(
                         msg.csid,
                         OutPrevHeader {
                             timestamp_ms: msg.timestamp_ms,
-                            timestamp_delta: 0,
                             stream_id: msg.stream_id,
                         },
                     );
                 }
             } else {
-                // Fmt 3 continuation
-                encode_basic_header(3, msg.csid, &mut hdr);
-                if let Some(prev) = self.prev_headers.get(&msg.csid) {
-                    if prev.timestamp_ms >= 0x00FF_FFFF || prev.timestamp_delta >= 0x00FF_FFFF {
-                        // Fmt0 が拡張タイムスタンプを使った場合の継続用
-                        if prev.timestamp_delta == 0 && prev.timestamp_ms >= 0x00FF_FFFF {
-                            hdr.extend_from_slice(&prev.timestamp_ms.to_be_bytes());
-                        } else if prev.timestamp_delta >= 0x00FF_FFFF {
-                            hdr.extend_from_slice(&prev.timestamp_delta.to_be_bytes());
-                        }
-                    }
+                // Fmt 3 continuation: 先頭チャンク (offset == 0) が拡張タイムスタンプを伴った場合のみ再送
+                hdr_len = encode_basic_header_buf(3, msg.csid, &mut hdr);
+                if let Some(ext_ts) = msg_ext_ts {
+                    hdr[hdr_len..hdr_len + 4].copy_from_slice(&ext_ts.to_be_bytes());
+                    hdr_len += 4;
                 }
             }
 
             writer
-                .write_all(&hdr)
+                .write_all(&hdr[..hdr_len])
                 .map_err(|e| CoreError::Network(format!("RTMP write header error: {}", e)))?;
-            total_written += hdr.len();
+            total_written += hdr_len;
 
             if chunk_len > 0 {
                 writer
@@ -159,18 +158,22 @@ impl Default for ChunkWriter {
     }
 }
 
-fn encode_basic_header(fmt: u8, csid: u32, out: &mut Vec<u8>) {
+#[inline]
+fn encode_basic_header_buf(fmt: u8, csid: u32, out: &mut [u8; 18]) -> usize {
     let f = (fmt & 0x03) << 6;
     if csid <= 63 {
-        out.push(f | (csid as u8));
+        out[0] = f | (csid as u8);
+        1
     } else if csid <= 319 {
-        out.push(f);
-        out.push((csid - 64) as u8);
+        out[0] = f;
+        out[1] = (csid - 64) as u8;
+        2
     } else {
-        out.push(f | 1);
+        out[0] = f | 1;
         let val = (csid - 64) as u16;
-        out.push((val & 0xFF) as u8);
-        out.push(((val >> 8) & 0xFF) as u8);
+        out[1] = (val & 0xFF) as u8;
+        out[2] = ((val >> 8) & 0xFF) as u8;
+        3
     }
 }
 

@@ -170,9 +170,9 @@ pub struct GpuLayer {
     pub src_height: u32,
     pub transform: LayerTransform,
     _plane0: Texture,
-    _plane1: Texture,
+    _plane1: Option<Texture>,
     view0: TextureView,
-    view1: TextureView,
+    view1: Option<TextureView>,
     uniform_buf: Buffer,
     bind_group: BindGroup,
 }
@@ -194,8 +194,8 @@ impl GpuLayer {
         &self.view0
     }
 
-    pub fn view1(&self) -> &TextureView {
-        &self.view1
+    pub fn view1(&self) -> Option<&TextureView> {
+        self.view1.as_ref()
     }
 }
 
@@ -301,6 +301,8 @@ pub struct ExternalRenderTarget<'a> {
     pub format: ExternalRenderFormat,
     /// `true` の場合、Pass 2（プレビュー）はこの `view` をテクスチャとして直接縮小ブリットする
     pub readable_for_preview_blit: bool,
+    /// 事前構築済みのプレビューブリット用 `BindGroup`（指定時はフレーム毎の `BindGroup` 再生成を省略）
+    pub preview_blit_bind_group: Option<&'a BindGroup>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -503,6 +505,7 @@ impl GpuCompositor {
     }
 
     /// ゼロコピー外部テクスチャビューから直接 `GpuLayer` を構築する（Issue #6 の Apple/Linux HAL 連携用）
+    /// 単一プレーン（RGBA/BGRA）の場合はコンポジタ共有の `dummy_view` を再利用し、ダミーテクスチャ確保を行わない。
     #[allow(clippy::too_many_arguments)]
     pub fn create_layer_from_textures(
         &self,
@@ -517,23 +520,10 @@ impl GpuCompositor {
         plane1: Option<Texture>,
     ) -> GpuLayer {
         let view0 = plane0.create_view(&TextureViewDescriptor::default());
-        let plane1_tex = plane1.unwrap_or_else(|| {
-            self.ctx.device.create_texture(&TextureDescriptor {
-                label: Some("ikakim-unused-plane1"),
-                size: Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba8Unorm,
-                usage: TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-        });
-        let view1 = plane1_tex.create_view(&TextureViewDescriptor::default());
+        let view1 = plane1
+            .as_ref()
+            .map(|t| t.create_view(&TextureViewDescriptor::default()));
+        let view1_ref = view1.as_ref().unwrap_or(&self.dummy_view);
         let uni = LayerUniformData::from_params(&transform, kind, color_space, src_width, src_height);
         let uniform_buf = Self::create_uniform_buffer(&self.ctx.device, &self.ctx.queue, uni);
         let bind_group = Self::make_bind_group(
@@ -541,7 +531,7 @@ impl GpuCompositor {
             &self.bind_group_layout,
             &uniform_buf,
             &view0,
-            &view1,
+            view1_ref,
             &self.sampler,
         );
 
@@ -554,12 +544,50 @@ impl GpuCompositor {
             src_height,
             transform,
             _plane0: plane0,
-            _plane1: plane1_tex,
+            _plane1: plane1,
             view0,
             view1,
             uniform_buf,
             bind_group,
         }
+    }
+
+    /// 既存の `GpuLayer` の GPU Uniform バッファを再利用したまま、ゼロコピー入力テクスチャを差し替える
+    pub fn update_layer_textures(
+        &self,
+        layer: &mut GpuLayer,
+        plane0: Texture,
+        plane1: Option<Texture>,
+    ) {
+        let view0 = plane0.create_view(&TextureViewDescriptor::default());
+        let view1 = plane1
+            .as_ref()
+            .map(|t| t.create_view(&TextureViewDescriptor::default()));
+        let view1_ref = view1.as_ref().unwrap_or(&self.dummy_view);
+        layer.bind_group = Self::make_bind_group(
+            &self.ctx.device,
+            &self.bind_group_layout,
+            &layer.uniform_buf,
+            &view0,
+            view1_ref,
+            &self.sampler,
+        );
+        layer._plane0 = plane0;
+        layer._plane1 = plane1;
+        layer.view0 = view0;
+        layer.view1 = view1;
+    }
+
+    /// 外部レンダーターゲットの `TextureView` からプレビュー縮小ブリット用 `BindGroup` を事前生成する
+    pub fn create_preview_blit_bind_group(&self, main_view: &TextureView) -> BindGroup {
+        Self::make_bind_group(
+            &self.ctx.device,
+            &self.bind_group_layout,
+            &self.preview_blit_uniform,
+            main_view,
+            &self.dummy_view,
+            &self.sampler,
+        )
     }
 
     /// CPU RGBA バッファからレイヤー生成（静止画・Top-Bottom Alpha RGBA 用）
@@ -724,16 +752,7 @@ impl GpuCompositor {
         preview_target: Option<ExternalRenderTarget<'_>>,
     ) -> CoreResult<RenderStats> {
         let start = Instant::now();
-        let internal_main_view = if main_target.is_none() {
-            Some(self.main_sink.acquire_target()?)
-        } else {
-            None
-        };
-        let internal_preview_view = if preview_target.is_none() {
-            Some(self.preview_sink.acquire_target()?)
-        } else {
-            None
-        };
+        let _ = pts;
 
         let mut visible: Vec<&GpuLayer> = layers
             .iter()
@@ -764,8 +783,7 @@ impl GpuCompositor {
         let main_view_ref = main_target
             .as_ref()
             .map(|t| t.view)
-            .or(internal_main_view.as_ref())
-            .expect("main render target view");
+            .unwrap_or(&self.main_sink.view);
         let main_pipeline = match main_target.as_ref().map(|t| t.format.to_wgpu()) {
             Some(TextureFormat::Bgra8Unorm) => &self.bgra_pipeline,
             _ => &self.pipeline,
@@ -774,8 +792,7 @@ impl GpuCompositor {
         let preview_view_ref = preview_target
             .as_ref()
             .map(|t| t.view)
-            .or(internal_preview_view.as_ref())
-            .expect("preview render target view");
+            .unwrap_or(&self.preview_sink.view);
         let preview_pipeline = match preview_target.as_ref().map(|t| t.format.to_wgpu()) {
             Some(TextureFormat::Bgra8Unorm) => &self.bgra_pipeline,
             _ => &self.pipeline,
@@ -812,18 +829,22 @@ impl GpuCompositor {
         }
 
         // Pass 2: プレビュー用（低解像度）スケール出力パス
-        let external_blit_bg = match main_target.as_ref() {
-            Some(ext) if ext.readable_for_preview_blit => Some(Self::make_bind_group(
-                &self.ctx.device,
-                &self.bind_group_layout,
-                &self.preview_blit_uniform,
-                ext.view,
-                &self.dummy_view,
-                &self.sampler,
-            )),
+        let transient_blit_bg = match main_target.as_ref() {
+            Some(ext) if ext.readable_for_preview_blit && ext.preview_blit_bind_group.is_none() => {
+                Some(self.create_preview_blit_bind_group(ext.view))
+            }
             _ => None,
         };
-        if let Some(ref bg) = external_blit_bg {
+        let external_blit_bg_ref = main_target
+            .as_ref()
+            .and_then(|ext| {
+                if ext.readable_for_preview_blit {
+                    ext.preview_blit_bind_group.or(transient_blit_bg.as_ref())
+                } else {
+                    None
+                }
+            });
+        if let Some(bg) = external_blit_bg_ref {
             Self::encode_blit_pass(&mut encoder, preview_pipeline, bg, preview_view_ref);
         } else if main_target.is_none() {
             Self::encode_blit_pass(
@@ -859,12 +880,6 @@ impl GpuCompositor {
         self.ctx.queue.submit(std::iter::once(cmd));
         self.ctx.device.poll(Maintain::Wait);
 
-        if let Some(mv) = internal_main_view {
-            let _ = self.main_sink.present_target(mv, pts);
-        }
-        if let Some(pv) = internal_preview_view {
-            let _ = self.preview_sink.present_target(pv, pts);
-        }
         let _ = (&self.dummy_tex, &self.dummy_view, &self.preview_blit_uniform);
 
         let elapsed_us = start.elapsed().as_micros() as u64;

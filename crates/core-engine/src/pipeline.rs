@@ -138,22 +138,20 @@ impl EngineControlBridge {
         self.inner.lock().unwrap().last_abr_decision.clone()
     }
 
-    /// ピークメーター（30Hz 通知用）の最新値をロックフリーハンドルから読み取って更新する
+    /// ピークメーター（30Hz 通知用）の最新値をロックフリーハンドルから読み取って更新する（ヒープ確保ゼロ）
     pub fn refresh_peaks(&self) {
         let mut g = self.inner.lock().unwrap();
-        let peaks: Vec<(usize, f32, f32)> = g
-            .channels
-            .iter()
-            .enumerate()
-            .map(|(i, h)| {
-                let (l, r) = h.take_peak_dbfs();
-                (i, l, r)
-            })
-            .collect();
-        let master = g.master.take_peak_dbfs();
-        g.last_master_peak = master;
-        for (id, l, r) in peaks {
-            if let Some(slot) = g.last_channel_peaks.iter_mut().find(|c| c.0 == id) {
+        let BridgeInner {
+            ref channels,
+            ref master,
+            ref mut last_master_peak,
+            ref mut last_channel_peaks,
+            ..
+        } = *g;
+        *last_master_peak = master.take_peak_dbfs();
+        for (id, h) in channels.iter().enumerate() {
+            let (l, r) = h.take_peak_dbfs();
+            if let Some(slot) = last_channel_peaks.iter_mut().find(|c| c.0 == id) {
                 slot.1 = l;
                 slot.2 = r;
             }
@@ -197,6 +195,21 @@ impl EngineControlBridge {
         }
         if let Some(pub_ref) = &g.publisher {
             let _ = pub_ref.enqueue(packet.clone());
+        }
+    }
+
+    /// 所有権付き `EncodedPacket` をクローンなしで RTMPS パブリッシャへゼロコピー転送する
+    pub fn forward_owned_packet_to_rtmp(&self, packet: core_types::media::EncodedPacket) {
+        let mut g = self.inner.lock().unwrap();
+        if packet.is_sequence_header {
+            match packet.codec {
+                CodecKind::H264 => g.cached_video_seq_header = Some(packet.clone()),
+                CodecKind::AacLc => g.cached_audio_seq_header = Some(packet.clone()),
+                _ => {}
+            }
+        }
+        if let Some(pub_ref) = &g.publisher {
+            let _ = pub_ref.enqueue(packet);
         }
     }
 
@@ -462,7 +475,7 @@ pub fn flush_encoders_to_outputs(ctx: &mut PipelineTickContext<'_>, _pts: PtsUs)
     }
 
     while let Some(pkt) = ctx.main_encoder.pull_packet()? {
-        ctx.bridge.forward_packet_to_rtmp(&pkt);
+        ctx.bridge.forward_owned_packet_to_rtmp(pkt);
     }
 
     while let Some(pkt) = ctx.preview_encoder.pull_packet()? {
