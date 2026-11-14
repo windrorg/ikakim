@@ -2,75 +2,179 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#050507" />
   <title>ikakim Studio — Control &amp; Low-Latency Preview</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
-<body>
+<body class="app-shell">
   <header class="topbar">
-    <div class="brand">
-      <span class="dot" id="ws-dot"></span>
-      <strong>ikakim</strong>
+    <div class="brand-group">
+      <span class="dot" id="ws-dot" title="WebSocket Status"></span>
+      <strong class="brand-title">ikakim</strong>
       <span class="badge" id="state-badge">Idle</span>
     </div>
-    <div class="telemetry">
-      <span>FPS: <strong id="fps-readout">0.0</strong></span>
-      <span>Bitrate: <strong id="bitrate-readout">0 kbps</strong></span>
-      <span>Preview Latency: <strong id="latency-readout">-- ms</strong></span>
+
+    <div class="telemetry-row">
+      <div class="tele-chip">
+        <span class="tele-label">FPS</span>
+        <strong class="tele-val mono" id="fps-readout">0.0</strong>
+      </div>
+      <div class="tele-chip">
+        <span class="tele-label">BITRATE</span>
+        <strong class="tele-val mono" id="bitrate-readout">0 kbps</strong>
+      </div>
+      <div class="tele-chip">
+        <span class="tele-label">LATENCY</span>
+        <strong class="tele-val mono" id="latency-readout">-- ms</strong>
+      </div>
     </div>
+
+    <nav class="nav-tabs desktop-nav" id="desktop-nav" aria-label="Workspace Views">
+      <button type="button" class="nav-btn active" data-route="studio">Studio</button>
+      <button type="button" class="nav-btn" data-route="mixer">Mixer</button>
+      <button type="button" class="nav-btn" data-route="overlay">Overlay</button>
+      <button type="button" class="nav-btn" data-route="diag">Diagnostics</button>
+    </nav>
   </header>
 
-  <main class="grid">
-    <section class="panel preview-panel">
-      <div class="panel-header">
-        <h2>MSE Low-Latency Preview (&le; 300ms Catch-up)</h2>
-        <span class="codec-label" id="codec-label">waiting for init segment...</span>
-      </div>
-      <div class="video-wrap">
-        <video id="preview-video" autoplay muted playsinline></video>
-      </div>
-      <div class="stream-bar">
-        <input id="rtmp-url" type="text" placeholder="rtmps://a.rtmps.youtube.com/live2/xxxx-yyyy" />
-        <button id="btn-stream-toggle" class="primary">Start Stream</button>
-      </div>
-    </section>
+  <main class="workspace" id="workspace">
+    <div class="col-primary" id="col-primary">
+      <section class="panel preview-panel" id="section-preview">
+        <div class="panel-header">
+          <div class="panel-title-row">
+            <span class="status-pill" id="preview-live-pill">PREVIEW</span>
+            <h2>MSE Low-Latency Preview (&le; 300ms Catch-up)</h2>
+          </div>
+          <span class="codec-label mono" id="codec-label">waiting for init segment...</span>
+        </div>
 
-    <section class="panel mixer-panel">
-      <div class="panel-header">
-        <h2>48kHz Audio Mixer &amp; Peak Meters (30Hz)</h2>
-      </div>
-      <div class="master-meter">
-        <div class="meter-title">MASTER OUT</div>
-        <div class="meter-bars">
-          <div class="bar-row"><span>L</span><div class="track"><div id="master-l-bar" class="fill"></div></div><span id="master-l-db" class="db">-96.0</span></div>
-          <div class="bar-row"><span>R</span><div class="track"><div id="master-r-bar" class="fill"></div></div><span id="master-r-db" class="db">-96.0</span></div>
+        <div class="video-frame">
+          <div class="video-inner">
+            <video id="preview-video" autoplay muted playsinline></video>
+            <div class="pip-stage" id="pip-stage" aria-label="Interactive PiP Overlay Stage">
+              <div class="pip-box" id="pip-box" title="Drag to move PiP, double-tap to center">
+                <div class="pip-tag" id="pip-tag">Layer 1</div>
+                <div class="pip-handle" id="pip-resize-handle" title="Drag to scale PiP"></div>
+              </div>
+            </div>
+          </div>
         </div>
-      </div>
-      <div id="channels-container" class="channels"></div>
-    </section>
 
-    <section class="panel overlay-panel">
-      <div class="panel-header">
-        <h2>GPU Overlay Transform</h2>
-      </div>
-      <div id="overlay-controls" class="overlay-controls">
-        <div class="field-row">
-          <label for="layer-select">Layer</label>
-          <select id="layer-select">
-            <option value="1">Layer 1: Overlay Video (Alpha)</option>
-            <option value="0">Layer 0: Main Camera</option>
-          </select>
-          <label class="inline-check"><input type="checkbox" id="layer-visible" checked /> Visible</label>
+        <div class="stream-bar">
+          <div class="url-input-wrap">
+            <input id="rtmp-url" type="text" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="rtmps://a.rtmps.youtube.com/live2/xxxx-yyyy" aria-label="RTMP Stream URL" />
+          </div>
+          <div class="stream-actions">
+            <button type="button" id="btn-stream-presets" class="btn-secondary" title="Stream URL &amp; Bitrate Presets">Presets</button>
+            <button type="button" id="btn-stream-toggle" class="btn-primary">Start Stream</button>
+          </div>
         </div>
-        <div class="sliders">
-          <label>Pos X <input type="range" id="layer-x" min="-1" max="1" step="0.02" value="0" /> <span id="layer-x-val">0.00</span></label>
-          <label>Pos Y <input type="range" id="layer-y" min="-1" max="1" step="0.02" value="0" /> <span id="layer-y-val">0.00</span></label>
-          <label>Scale <input type="range" id="layer-scale" min="0.1" max="1.5" step="0.02" value="0.5" /> <span id="layer-scale-val">0.50</span></label>
-          <label>Opacity <input type="range" id="layer-opacity" min="0" max="1" step="0.02" value="1" /> <span id="layer-opacity-val">1.00</span></label>
+      </section>
+
+      <section class="panel overlay-panel" id="section-overlay">
+        <div class="panel-header">
+          <h2>GPU Overlay Transform &amp; PiP Composer</h2>
+          <button type="button" id="btn-overlay-reset" class="btn-ghost">Reset Center</button>
         </div>
-      </div>
-    </section>
+        <div id="overlay-controls" class="overlay-controls">
+          <div class="field-row">
+            <div class="select-wrap">
+              <label class="field-caption" for="layer-select">Target Layer</label>
+              <select id="layer-select">
+                <option value="1">Layer 1: Overlay Video (Alpha)</option>
+                <option value="0">Layer 0: Main Camera</option>
+              </select>
+            </div>
+            <label class="toggle-chip">
+              <input type="checkbox" id="layer-visible" checked />
+              <span>Visible</span>
+            </label>
+          </div>
+
+          <div class="sliders-flex">
+            <div class="slider-card">
+              <div class="slider-head">
+                <label for="layer-x">Pos X</label>
+                <span class="mono val-badge" id="layer-x-val">0.00</span>
+              </div>
+              <input type="range" id="layer-x" min="-1" max="1" step="0.02" value="0" />
+            </div>
+
+            <div class="slider-card">
+              <div class="slider-head">
+                <label for="layer-y">Pos Y</label>
+                <span class="mono val-badge" id="layer-y-val">0.00</span>
+              </div>
+              <input type="range" id="layer-y" min="-1" max="1" step="0.02" value="0" />
+            </div>
+
+            <div class="slider-card">
+              <div class="slider-head">
+                <label for="layer-scale">Scale</label>
+                <span class="mono val-badge" id="layer-scale-val">0.50</span>
+              </div>
+              <input type="range" id="layer-scale" min="0.1" max="1.5" step="0.02" value="0.5" />
+            </div>
+
+            <div class="slider-card">
+              <div class="slider-head">
+                <label for="layer-opacity">Opacity</label>
+                <span class="mono val-badge" id="layer-opacity-val">1.00</span>
+              </div>
+              <input type="range" id="layer-opacity" min="0" max="1" step="0.02" value="1" />
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="col-secondary" id="col-secondary">
+      <section class="panel mixer-panel" id="section-mixer">
+        <div class="panel-header">
+          <h2>48kHz Audio Mixer &amp; Peak Meters (30Hz)</h2>
+          <button type="button" id="btn-clip-reset" class="btn-ghost">Clear Clips</button>
+        </div>
+
+        <div class="master-meter" id="master-meter-card">
+          <div class="meter-head-row">
+            <span class="meter-title">MASTER OUT</span>
+            <span class="clip-badge" id="master-clip-badge">PEAK OK</span>
+          </div>
+          <div class="meter-bars">
+            <div class="bar-row">
+              <span class="ch-tag">L</span>
+              <div class="track"><div id="master-l-bar" class="fill"></div><div id="master-l-hold" class="peak-hold"></div></div>
+              <span id="master-l-db" class="db mono">-96.0</span>
+            </div>
+            <div class="bar-row">
+              <span class="ch-tag">R</span>
+              <div class="track"><div id="master-r-bar" class="fill"></div><div id="master-r-hold" class="peak-hold"></div></div>
+              <span id="master-r-db" class="db mono">-96.0</span>
+            </div>
+          </div>
+        </div>
+
+        <div id="channels-container" class="channels"></div>
+      </section>
+
+      <section class="panel diag-panel" id="section-diag">
+        <div class="panel-header">
+          <h2>Pipeline &amp; Transport Diagnostics</h2>
+          <button type="button" id="btn-refresh-status" class="btn-ghost">Sync</button>
+        </div>
+        <div class="diag-stats" id="diag-stats"></div>
+        <div class="diag-log" id="diag-log"></div>
+      </section>
+    </div>
   </main>
+
+  <nav class="mobile-tabbar" id="mobile-nav" aria-label="Mobile Navigation">
+    <button type="button" class="tab-item active" data-route="studio">Studio</button>
+    <button type="button" class="tab-item" data-route="mixer">Mixer</button>
+    <button type="button" class="tab-item" data-route="overlay">Overlay</button>
+    <button type="button" class="tab-item" data-route="diag">Diag</button>
+  </nav>
 
   <script src="/app.js"></script>
 </body>

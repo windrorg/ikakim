@@ -215,14 +215,30 @@ fn test_embedded_server_http_and_ws_jsonrpc_fmp4_30hz_meters() {
     let mut server = EmbeddedServer::start(cfg, backend.clone()).unwrap();
     let addr = server.local_addr();
 
-    // 1. HTTP/1.1 静的アセット取得確認 (/, /app.js)
+    // 1. HTTP/1.1 静的アセット取得確認 (/, /style.css, /app.js)
     let html_resp = http_get(addr, "/");
     assert!(html_resp.starts_with("HTTP/1.1 200 OK"), "resp={}", &html_resp[..html_resp.len().min(60)]);
     assert!(html_resp.contains("MSE Low-Latency Preview"));
+    for required_id in [
+        "id=\"pip-box\"",
+        "id=\"pip-resize-handle\"",
+        "id=\"master-l-hold\"",
+        "id=\"diag-stats\"",
+        "id=\"btn-stream-presets\"",
+    ] {
+        assert!(html_resp.contains(required_id), "missing {required_id} in /");
+    }
+
+    let css_resp = http_get(addr, "/style.css");
+    assert!(css_resp.starts_with("HTTP/1.1 200 OK"));
+    for forbidden_css in ["display: grid", "backdrop-filter", "var(--", "aspect-ratio:"] {
+        assert!(!css_resp.contains(forbidden_css), "unexpected {forbidden_css} in /style.css");
+    }
 
     let js_resp = http_get(addr, "/app.js");
     assert!(js_resp.starts_with("HTTP/1.1 200 OK"));
     assert!(js_resp.contains("MAX_LATENCY_SEC = 0.30"));
+    assert!(!js_resp.contains("innerHTML"), "innerHTML must never appear in /app.js");
 
     let api_resp = http_get(addr, "/api/status");
     assert!(api_resp.contains("Camera Mic"));
@@ -567,4 +583,122 @@ fn test_ws_64bit_mask_and_single_write_small_frame_coalescing() {
         let msg = read_ws_message(&mut Cursor::new(cw.buf)).unwrap();
         assert_eq!(msg, WsMessage::Text("x".repeat(sz)));
     }
+}
+
+#[test]
+fn test_webui_all_rpc_actions_and_subset_invariants() {
+    let backend = DefaultControlBackend::new();
+    backend.update_meters(0.0, -0.5, &[(0, 0.0, -6.0)]);
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        meter_interval_ms: 40,
+        preview_width: 1280,
+        preview_height: 720,
+        preview_fps: 30,
+    };
+    let server = EmbeddedServer::start(cfg, backend.clone()).unwrap();
+    let addr = server.local_addr();
+
+    // Verify all embedded Web UI assets enforce strict mobile/subset safety and controls
+    let html_resp = http_get(addr, "/");
+    for needle in [
+        "autocomplete=\"off\"",
+        "autocapitalize=\"none\"",
+        "id=\"btn-overlay-reset\"",
+        "id=\"btn-refresh-status\"",
+        "id=\"btn-clip-reset\"",
+        "id=\"layer-select\"",
+        "id=\"layer-visible\"",
+        "id=\"layer-x\"",
+        "id=\"layer-y\"",
+        "id=\"layer-scale\"",
+        "id=\"layer-opacity\"",
+    ] {
+        assert!(html_resp.contains(needle), "missing {needle} in /");
+    }
+
+    let css_resp = http_get(addr, "/style.css");
+    assert!(!css_resp.contains(".sheet-mode"), "dead CSS rule .sheet-mode should stay removed");
+    assert!(css_resp.contains(".pop-item.active"));
+
+    let js_resp = http_get(addr, "/app.js");
+    assert!(js_resp.contains("URL.revokeObjectURL"));
+    assert!(js_resp.contains("Number.isFinite(db) ? db : -96"));
+    assert!(!js_resp.contains("innerHTML"));
+
+    // Exercise every JSON-RPC call initiated by Web UI controls
+    let calls = [
+        (
+            1,
+            r#"{"jsonrpc":"2.0","id":1,"method":"stream.start","params":{"rtmp_url":"rtmp://127.0.0.1:1935/live/livestream","bitrate_bps":6000000}}"#,
+        ),
+        (
+            2,
+            r#"{"jsonrpc":"2.0","id":2,"method":"audio.set_gain","params":{"channel":0,"gain_db":-6.0}}"#,
+        ),
+        (
+            3,
+            r#"{"jsonrpc":"2.0","id":3,"method":"audio.set_delay","params":{"channel":0,"delay_ms":42}}"#,
+        ),
+        (
+            4,
+            r#"{"jsonrpc":"2.0","id":4,"method":"audio.set_mute","params":{"channel":0,"muted":true}}"#,
+        ),
+        (
+            5,
+            r#"{"jsonrpc":"2.0","id":5,"method":"overlay.set_transform","params":{"layer_id":1,"x":0.35,"y":-0.40,"scale_x":0.72,"scale_y":0.72,"opacity":0.85,"visible":false}}"#,
+        ),
+        (
+            6,
+            r#"{"jsonrpc":"2.0","id":6,"method":"engine.get_status","params":{}}"#,
+        ),
+        (
+            7,
+            r#"{"jsonrpc":"2.0","id":7,"method":"stream.stop","params":{}}"#,
+        ),
+    ];
+
+    let mut status_snap = None;
+    for (id, payload) in calls {
+        let resp_txt = handle_rpc_message(backend.as_ref(), payload);
+        let resp = parse_json(&resp_txt).unwrap();
+        assert_eq!(resp.get("id").and_then(|v| v.as_i64()), Some(id));
+        assert!(resp.get("error").is_none(), "unexpected RPC error: {resp_txt}");
+        if id == 6 {
+            status_snap = Some(resp);
+        }
+    }
+
+    let status = status_snap.unwrap();
+    let result = status.get("result").unwrap();
+    let stream = result.get("stream").unwrap();
+    assert_eq!(stream.get("state").and_then(|v| v.as_str()), Some("Streaming"));
+    assert_eq!(
+        stream.get("bitrate_bps").and_then(|v| v.as_i64()),
+        Some(6_000_000)
+    );
+    assert_eq!(
+        result
+            .get("master")
+            .unwrap()
+            .get("left_dbfs")
+            .and_then(|v| v.as_f64()),
+        Some(0.0)
+    );
+
+    // Invalid RPC method & missing parameter must return structured JSON-RPC errors
+    let bad_method = parse_json(&handle_rpc_message(
+        backend.as_ref(),
+        r#"{"jsonrpc":"2.0","id":99,"method":"unknown.op","params":{}}"#,
+    ))
+    .unwrap();
+    assert!(bad_method.get("error").is_some());
+
+    let missing_param = parse_json(&handle_rpc_message(
+        backend.as_ref(),
+        r#"{"jsonrpc":"2.0","id":100,"method":"stream.start","params":{}}"#,
+    ))
+    .unwrap();
+    assert!(missing_param.get("error").is_some());
 }
