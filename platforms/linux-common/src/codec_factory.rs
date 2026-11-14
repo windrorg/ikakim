@@ -191,8 +191,7 @@ fn rgba_to_nv12(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
         let y1 = y0 + 1;
         let rgba_row0 = &rgba[y0 * row_bytes..(y0 + 1) * row_bytes];
         let rgba_row1 = &rgba[y1 * row_bytes..(y1 + 1) * row_bytes];
-        let y_out0 = &mut y_plane[y0 * w..(y0 + 1) * w];
-        let y_out1 = &mut y_plane[y1 * w..(y1 + 1) * w];
+        let (y_out0, y_out1) = y_plane[y0 * w..(y0 + 2) * w].split_at_mut(w);
         let uv_out = &mut uv_plane[y_pair * w..(y_pair + 1) * w];
 
         for x_pair in 0..(w / 2) {
