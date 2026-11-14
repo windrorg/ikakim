@@ -2,7 +2,7 @@
 
 iOS / Android / Linux arm64 (Rockchip RK3588, Amlogic S905X2) / macOS に対応した、ゼロコピー GPU コンポジタ & ゼロ依存志向 Rust コアによるマルチプラットフォーム・ライブ配信エンジンです。
 
-詳細な設計仕様とモジュール構成は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) を参照してください。
+詳細な設計仕様とモジュール構成は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)、各プラットフォーム（macOS / iOS / iPadOS / Android 実機・エミュレーター）での起動・E2E 検証・リモートアクセス手順は [docs/RUNNING_AND_VERIFICATION.md](docs/RUNNING_AND_VERIFICATION.md) を参照してください。
 
 ## ワークスペース構成
 
@@ -59,4 +59,11 @@ cargo run -p platform-linux-arm64 --release -- --soak --frames 150
 ./scripts/build-android-jni.sh --release
 # 続いて Android Studio または platforms/android で Gradle ビルドを実行
 cd platforms/android && gradle assembleDebug
+```
+
+### 5. 一括 E2E 検証スクリプト（詳細は [docs/RUNNING_AND_VERIFICATION.md](docs/RUNNING_AND_VERIFICATION.md)）
+```bash
+./scripts/run-macos-e2e.sh
+./scripts/run-ios-sim-e2e.sh
+./scripts/run-android-e2e.sh
 ```
