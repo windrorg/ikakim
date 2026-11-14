@@ -149,29 +149,40 @@ fn arm64_main(args: &[String]) {
     let fd_before = fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0);
     let rss_before = read_rss_pages();
     let started = Instant::now();
-    let fallback_yuyv = vec![0x80u8; (width as usize) * (height as usize) * 2];
+    let fallback_frame = VideoFrame {
+        width,
+        height,
+        format: PixelFormat::Yuyv,
+        pts: PtsUs(0),
+        handle: NativeBufferHandle::CpuFallback {
+            data: vec![0x80u8; (width as usize) * (height as usize) * 2],
+            stride: width * 2,
+        },
+    };
+    let static_fallback_imported = if v4l2_cap.is_none() {
+        Some(
+            importer
+                .import_frame_to_layer(&comp, &fallback_frame, 0, true, LayerTransform::default())
+                .expect("import static fallback frame"),
+        )
+    } else {
+        None
+    };
     let mut mix_buf = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
 
     for i in 0..frames {
         let pts = PtsUs(i * (1_000_000 / u64::from(fps.max(1))));
-        let cam_frame = match v4l2_cap {
-            Some(ref mut dev) => dev.capture_frame(pts, 2000).expect("V4L2 capture"),
-            None => VideoFrame {
-                width,
-                height,
-                format: PixelFormat::Yuyv,
-                pts,
-                handle: NativeBufferHandle::CpuFallback {
-                    data: fallback_yuyv.clone(),
-                    stride: width * 2,
-                },
-            },
-        };
-        let imported = importer
-            .import_frame_to_layer(&comp, &cam_frame, 0, true, LayerTransform::default())
-            .expect("import frame");
-        comp.render_dual(&[&imported.layer], pts)
-            .expect("render_dual");
+        if let Some(ref mut dev) = v4l2_cap {
+            let cam_frame = dev.capture_frame(pts, 2000).expect("V4L2 capture");
+            let imported = importer
+                .import_frame_to_layer(&comp, &cam_frame, 0, true, LayerTransform::default())
+                .expect("import frame");
+            comp.render_dual(&[&imported.layer], pts)
+                .expect("render_dual");
+        } else if let Some(ref imported) = static_fallback_imported {
+            comp.render_dual(&[&imported.layer], pts)
+                .expect("render_dual");
+        }
         main_enc
             .encode_compositor_target(&comp, comp.main_texture(), None, width, height, pts)
             .expect("encode main");

@@ -65,7 +65,7 @@ impl JsonValue {
 
     /// コンパクトな JSON 文字列へシリアライズする
     pub fn to_json_string(&self) -> String {
-        let mut out = String::new();
+        let mut out = String::with_capacity(128);
         self.write_json(&mut out);
         out
     }
@@ -113,18 +113,35 @@ impl JsonValue {
 
 fn write_escaped_string(s: &str, out: &mut String) {
     out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
+    let bytes = s.as_bytes();
+    let mut last = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        let escaped = match b {
+            b'"' => Some("\\\""),
+            b'\\' => Some("\\\\"),
+            b'\n' => Some("\\n"),
+            b'\r' => Some("\\r"),
+            b'\t' => Some("\\t"),
+            c if c < 0x20 => {
+                if i > last {
+                    out.push_str(&s[last..i]);
+                }
                 let _ = write!(out, "\\u{:04x}", c as u32);
+                last = i + 1;
+                None
             }
-            c => out.push(c),
+            _ => None,
+        };
+        if let Some(esc) = escaped {
+            if i > last {
+                out.push_str(&s[last..i]);
+            }
+            out.push_str(esc);
+            last = i + 1;
         }
+    }
+    if last < s.len() {
+        out.push_str(&s[last..]);
     }
     out.push('"');
 }

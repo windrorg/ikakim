@@ -183,23 +183,48 @@ fn rgba_to_nv12(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
     let y_len = w * h;
     let uv_len = y_len / 2;
     let mut out = vec![0u8; y_len + uv_len];
-    for y in 0..h {
-        for x in 0..w {
-            let p = (y * w + x) * 4;
-            let r = rgba[p] as i32;
-            let g = rgba[p + 1] as i32;
-            let b = rgba[p + 2] as i32;
-            let luma = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            out[y * w + x] = luma.clamp(0, 255) as u8;
-            if (y % 2 == 0) && (x % 2 == 0) {
-                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                let uv_idx = y_len + (y / 2) * w + x;
-                if uv_idx + 1 < out.len() {
-                    out[uv_idx] = u.clamp(0, 255) as u8;
-                    out[uv_idx + 1] = v.clamp(0, 255) as u8;
-                }
-            }
+    let (y_plane, uv_plane) = out.split_at_mut(y_len);
+    let row_bytes = w * 4;
+
+    for y_pair in 0..(h / 2) {
+        let y0 = y_pair * 2;
+        let y1 = y0 + 1;
+        let rgba_row0 = &rgba[y0 * row_bytes..(y0 + 1) * row_bytes];
+        let rgba_row1 = &rgba[y1 * row_bytes..(y1 + 1) * row_bytes];
+        let y_out0 = &mut y_plane[y0 * w..(y0 + 1) * w];
+        let y_out1 = &mut y_plane[y1 * w..(y1 + 1) * w];
+        let uv_out = &mut uv_plane[y_pair * w..(y_pair + 1) * w];
+
+        for x_pair in 0..(w / 2) {
+            let x0 = x_pair * 2;
+            let x1 = x0 + 1;
+            let p00 = x0 * 4;
+            let p01 = x1 * 4;
+
+            let r00 = rgba_row0[p00] as i32;
+            let g00 = rgba_row0[p00 + 1] as i32;
+            let b00 = rgba_row0[p00 + 2] as i32;
+            y_out0[x0] = (((66 * r00 + 129 * g00 + 25 * b00 + 128) >> 8) + 16).clamp(0, 255) as u8;
+
+            let r01 = rgba_row0[p01] as i32;
+            let g01 = rgba_row0[p01 + 1] as i32;
+            let b01 = rgba_row0[p01 + 2] as i32;
+            y_out0[x1] = (((66 * r01 + 129 * g01 + 25 * b01 + 128) >> 8) + 16).clamp(0, 255) as u8;
+
+            let r10 = rgba_row1[p00] as i32;
+            let g10 = rgba_row1[p00 + 1] as i32;
+            let b10 = rgba_row1[p00 + 2] as i32;
+            y_out1[x0] = (((66 * r10 + 129 * g10 + 25 * b10 + 128) >> 8) + 16).clamp(0, 255) as u8;
+
+            let r11 = rgba_row1[p01] as i32;
+            let g11 = rgba_row1[p01 + 1] as i32;
+            let b11 = rgba_row1[p01 + 2] as i32;
+            y_out1[x1] = (((66 * r11 + 129 * g11 + 25 * b11 + 128) >> 8) + 16).clamp(0, 255) as u8;
+
+            let u = ((-38 * r00 - 74 * g00 + 112 * b00 + 128) >> 8) + 128;
+            let v = ((112 * r00 - 94 * g00 - 18 * b00 + 128) >> 8) + 128;
+            uv_out[x0] = u.clamp(0, 255) as u8;
+            uv_out[x1] = v.clamp(0, 255) as u8;
         }
     }
     out

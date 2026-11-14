@@ -265,15 +265,17 @@ impl RtmpPublisher {
                     }
                     has_connected_before = true;
 
-                    // メディア送信ループ
+                    // メディア送信ループ（1回のMutexロックで最大8パケットを一括ポップし、ロック競合を最小化）
                     let mut last_inbound_poll = Instant::now();
-                    loop {
+                    let mut batch = Vec::with_capacity(8);
+                    'send_loop: loop {
                         if stop_clone.load(Ordering::Acquire) {
                             client.close();
                             break 'outer;
                         }
 
-                        let pkt_opt = {
+                        batch.clear();
+                        {
                             let (lock, cvar) = &*q_clone;
                             let mut guard = lock.lock().unwrap();
                             if guard.items.is_empty() && !guard.closed {
@@ -282,20 +284,25 @@ impl RtmpPublisher {
                                     .unwrap();
                                 guard = g;
                             }
-                            if let Some(pkt) = guard.items.pop_front() {
-                                guard.queued_bytes = guard.queued_bytes.saturating_sub(pkt.data.len());
+                            while batch.len() < 8 {
+                                if let Some(pkt) = guard.items.pop_front() {
+                                    guard.queued_bytes =
+                                        guard.queued_bytes.saturating_sub(pkt.data.len());
+                                    batch.push(pkt);
+                                } else {
+                                    break;
+                                }
+                            }
+                            if !batch.is_empty() {
                                 q_bytes_pub.store(guard.queued_bytes, Ordering::Release);
-                                Some(pkt)
                             } else if guard.closed {
                                 client.close();
                                 break 'outer;
-                            } else {
-                                None
                             }
-                        };
+                        }
 
-                        let queue_was_idle = pkt_opt.is_none();
-                        if let Some(pkt) = pkt_opt {
+                        let queue_was_idle = batch.is_empty();
+                        for pkt in batch.drain(..) {
                             if waiting_for_keyframe
                                 && pkt.codec == CodecKind::H264
                                 && !pkt.is_sequence_header
@@ -332,7 +339,7 @@ impl RtmpPublisher {
                                         e
                                     )));
                                     sleep_interruptible(backoff_ms, &stop_clone);
-                                    break;
+                                    break 'send_loop;
                                 }
                             }
                         }
@@ -348,7 +355,7 @@ impl RtmpPublisher {
                                     e
                                 )));
                                 sleep_interruptible(backoff_ms, &stop_clone);
-                                break;
+                                break 'send_loop;
                             }
                         }
                     }

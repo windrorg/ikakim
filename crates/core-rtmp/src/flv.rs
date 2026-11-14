@@ -3,11 +3,18 @@ use crate::client::StreamMetadata;
 use core_types::media::{CodecKind, EncodedPacket};
 use core_types::{CoreError, CoreResult};
 
-/// FLV VideoTagHeader + AVC パケットの生成
+/// FLV VideoTagHeader + AVC パケットの生成（新規 `Vec<u8>` を返す）
 /// `packet.is_sequence_header == true` の場合は `AVCDecoderConfigurationRecord` を格納、
 /// 通常フレームの場合は 4バイト長プレフィックス付き AVCC NAL ユニット群を格納する。
 /// （入力が Annex-B `00 00 00 01` スタートコード形式の場合は自動で AVCC へ変換する）
 pub fn pack_video_tag(packet: &EncodedPacket) -> CoreResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(5 + packet.data.len() + 16);
+    pack_video_tag_into(packet, &mut out)?;
+    Ok(out)
+}
+
+/// 呼び出し元の再利用バッファ `out` へ FLV VideoTagHeader + AVC パケットを書き込む（ゼロアロケーション対応）
+pub fn pack_video_tag_into(packet: &EncodedPacket, out: &mut Vec<u8>) -> CoreResult<()> {
     if packet.codec != CodecKind::H264 {
         return Err(CoreError::UnsupportedFormat(format!(
             "RTMP FLV video packer currently expects H.264, got {:?}",
@@ -15,21 +22,21 @@ pub fn pack_video_tag(packet: &EncodedPacket) -> CoreResult<Vec<u8>> {
         )));
     }
 
+    out.clear();
     if packet.is_sequence_header {
         // AVCDecoderConfigurationRecord がすでに渡された場合はクローンせず直接書き込み、
         // Annex-B (SPS+PPS) が渡された場合は変換する
         if looks_like_annexb(&packet.data) {
             let config_record = build_avc_decoder_config_from_annexb(&packet.data)?;
-            let mut out = Vec::with_capacity(5 + config_record.len());
+            out.reserve(5 + config_record.len());
             out.extend_from_slice(&[0x17, 0x00, 0x00, 0x00, 0x00]);
             out.extend_from_slice(&config_record);
-            return Ok(out);
         } else {
-            let mut out = Vec::with_capacity(5 + packet.data.len());
+            out.reserve(5 + packet.data.len());
             out.extend_from_slice(&[0x17, 0x00, 0x00, 0x00, 0x00]);
             out.extend_from_slice(&packet.data);
-            return Ok(out);
         }
+        return Ok(());
     }
 
     let pts_ms = packet.pts.0 / 1_000;
@@ -37,22 +44,29 @@ pub fn pack_video_tag(packet: &EncodedPacket) -> CoreResult<Vec<u8>> {
     let cts_ms = pts_ms.saturating_sub(dts_ms).min(0xFF_FFFF) as i32;
 
     let frame_type: u8 = if packet.is_keyframe { 0x10 } else { 0x20 };
-    let mut out = Vec::with_capacity(5 + packet.data.len() + 16);
+    out.reserve(5 + packet.data.len() + 16);
     out.push(frame_type | 0x07); // AVC codec ID = 7
     out.push(0x01); // AVC NALU
     out.push(((cts_ms >> 16) & 0xFF) as u8);
     out.push(((cts_ms >> 8) & 0xFF) as u8);
     out.push((cts_ms & 0xFF) as u8);
     if looks_like_annexb(&packet.data) {
-        append_annexb_to_avcc(&packet.data, &mut out);
+        append_annexb_to_avcc(&packet.data, out);
     } else {
         out.extend_from_slice(&packet.data);
     }
+    Ok(())
+}
+
+/// FLV AudioTagHeader + AAC パケットの生成（新規 `Vec<u8>` を返す）
+pub fn pack_audio_tag(packet: &EncodedPacket) -> CoreResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(2 + packet.data.len());
+    pack_audio_tag_into(packet, &mut out)?;
     Ok(out)
 }
 
-/// FLV AudioTagHeader + AAC パケットの生成
-pub fn pack_audio_tag(packet: &EncodedPacket) -> CoreResult<Vec<u8>> {
+/// 呼び出し元の再利用バッファ `out` へ FLV AudioTagHeader + AAC パケットを書き込む（ゼロアロケーション対応）
+pub fn pack_audio_tag_into(packet: &EncodedPacket, out: &mut Vec<u8>) -> CoreResult<()> {
     if packet.codec != CodecKind::AacLc {
         return Err(CoreError::UnsupportedFormat(format!(
             "RTMP FLV audio packer expects AAC-LC, got {:?}",
@@ -60,12 +74,13 @@ pub fn pack_audio_tag(packet: &EncodedPacket) -> CoreResult<Vec<u8>> {
         )));
     }
 
-    let mut out = Vec::with_capacity(2 + packet.data.len());
+    out.clear();
+    out.reserve(2 + packet.data.len());
     // SoundFormat=10 (AAC), SoundRate=3 (44kHz marker per FLV spec), SoundSize=1 (16-bit), SoundType=1 (Stereo) -> 0xAF
     out.push(0xAF);
     out.push(if packet.is_sequence_header { 0x00 } else { 0x01 });
     out.extend_from_slice(&packet.data);
-    Ok(out)
+    Ok(())
 }
 
 /// `@setDataFrame` + `onMetaData` AMF0 ペイロードの構築

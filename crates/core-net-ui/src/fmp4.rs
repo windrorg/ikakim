@@ -140,6 +140,27 @@ impl Fmp4Muxer {
         }
     }
 
+    /// プレビュークライアント不在時にメディアパケットの構築をスキップし、タイムスタンプ進行と初期IDR状態のみ維持する
+    pub fn note_skipped_media_packet(&mut self, packet: &EncodedPacket) {
+        if packet.is_sequence_header {
+            return;
+        }
+        match packet.codec {
+            CodecKind::AacLc => {
+                self.last_audio_pts_us = Some(packet.pts.0);
+                self.pending_audio.clear();
+            }
+            CodecKind::H264 => {
+                if self.waiting_for_idr && packet.is_keyframe {
+                    self.waiting_for_idr = false;
+                }
+                self.last_video_pts_us = Some(packet.pts.0);
+                self.pending_audio.clear();
+            }
+            CodecKind::Hevc => {}
+        }
+    }
+
     /// `EncodedPacket` を投入し、生成された fMP4 セグメント（Init または Media）を返す。
     /// 低遅延 MSE のため、IDR キーフレームを受信済みであれば各ビデオフレームごとに `moof+mdat` を即時出力する。
     pub fn push_packet(

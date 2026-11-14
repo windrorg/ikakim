@@ -464,8 +464,8 @@ impl IkakimEngineHandle {
             .as_dyn_mut()
             .push_pcm_f32(&self.pcm_scratch, pts)?;
 
-        // Sync UI overlay transforms to GPU layers
-        {
+        // Sync UI overlay transforms to GPU layers (only allocate Vec<&mut GpuLayer> when dirty)
+        if self.bridge.has_pending_transforms() {
             let mut mut_refs: Vec<&mut GpuLayer> =
                 self.layers.values_mut().map(StoredLayer::as_layer_mut).collect();
             self.bridge

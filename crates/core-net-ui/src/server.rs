@@ -10,7 +10,7 @@ use core_types::media::EncodedPacket;
 use core_types::{CoreError, CoreResult};
 use std::io::{BufReader, ErrorKind};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -39,8 +39,8 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone)]
 enum OutboundMsg {
-    Text(String),
-    Binary(Vec<u8>),
+    Text(Arc<str>),
+    Binary(Arc<[u8]>),
     Pong(Vec<u8>),
     Close,
 }
@@ -60,7 +60,7 @@ struct ClientHandle {
 
 struct PreviewState {
     muxer: Fmp4Muxer,
-    init_segment: Option<Vec<u8>>,
+    init_segment: Option<Arc<[u8]>>,
     mime_type: Option<String>,
 }
 
@@ -69,6 +69,7 @@ pub struct EmbeddedServer {
     local_addr: SocketAddr,
     stop_flag: Arc<AtomicBool>,
     clients: Arc<Mutex<Vec<ClientHandle>>>,
+    preview_client_count: Arc<AtomicUsize>,
     preview: Arc<Mutex<PreviewState>>,
     config: ServerConfig,
     accept_handle: Option<JoinHandle<()>>,
@@ -89,6 +90,7 @@ impl EmbeddedServer {
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let clients: Arc<Mutex<Vec<ClientHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let preview_client_count = Arc::new(AtomicUsize::new(0));
         let preview = Arc::new(Mutex::new(PreviewState {
             muxer: Fmp4Muxer::new(),
             init_segment: None,
@@ -98,6 +100,7 @@ impl EmbeddedServer {
         // 1. Accept ループスレッド
         let stop_acc = Arc::clone(&stop_flag);
         let clients_acc = Arc::clone(&clients);
+        let preview_cnt_acc = Arc::clone(&preview_client_count);
         let preview_acc = Arc::clone(&preview);
         let backend_acc = Arc::clone(&backend);
         let accept_handle = thread::Builder::new()
@@ -111,13 +114,20 @@ impl EmbeddedServer {
                             next_client_id += 1;
                             let s_stop = Arc::clone(&stop_acc);
                             let s_clients = Arc::clone(&clients_acc);
+                            let s_prev_cnt = Arc::clone(&preview_cnt_acc);
                             let s_preview = Arc::clone(&preview_acc);
                             let s_backend = Arc::clone(&backend_acc);
                             let _ = thread::Builder::new()
                                 .name(format!("ikakim-conn-{}", cid))
                                 .spawn(move || {
                                     handle_connection(
-                                        cid, stream, s_stop, s_clients, s_preview, s_backend,
+                                        cid,
+                                        stream,
+                                        s_stop,
+                                        s_clients,
+                                        s_prev_cnt,
+                                        s_preview,
+                                        s_backend,
                                     );
                                 });
                         }
@@ -156,7 +166,7 @@ impl EmbeddedServer {
                     };
                     if has_ctrl_clients {
                         let snap = backend_meter.snapshot();
-                        let json = make_meter_notification(&snap);
+                        let json: Arc<str> = Arc::from(make_meter_notification(&snap));
                         broadcast_msg(&clients_meter, OutboundMsg::Text(json), true, false);
                     }
                 }
@@ -167,6 +177,7 @@ impl EmbeddedServer {
             local_addr,
             stop_flag,
             clients,
+            preview_client_count,
             preview,
             config,
             accept_handle: Some(accept_handle),
@@ -182,8 +193,15 @@ impl EmbeddedServer {
         self.clients.lock().unwrap().len()
     }
 
-    /// プレビュー用 H.264 / AAC `EncodedPacket` を fMP4 へパッケージングし、接続中の WS クライアントへ配信する
+    /// プレビュー用 H.264 / AAC `EncodedPacket` を fMP4 へパッケージングし、接続中の WS クライアントへ配信する。
+    /// プレビュークライアントが 0 人の時は `moof+mdat` メディアセグメントのメモリ構築をバイパスする。
     pub fn push_preview_packet(&self, packet: &EncodedPacket) -> CoreResult<()> {
+        if !packet.is_sequence_header && self.preview_client_count.load(Ordering::Acquire) == 0 {
+            let mut prev = self.preview.lock().unwrap();
+            prev.muxer.note_skipped_media_packet(packet);
+            return Ok(());
+        }
+
         let seg_opt = {
             let mut prev = self.preview.lock().unwrap();
             let seg = prev.muxer.push_packet(
@@ -192,30 +210,33 @@ impl EmbeddedServer {
                 self.config.preview_height,
                 self.config.preview_fps,
             )?;
-            if let Some(ref s) = seg {
+            let mut arc_bytes: Option<Arc<[u8]>> = None;
+            if let Some(s) = &seg {
+                let shared: Arc<[u8]> = Arc::from(s.bytes.as_slice());
                 if s.is_init {
-                    prev.init_segment = Some(s.bytes.clone());
+                    prev.init_segment = Some(Arc::clone(&shared));
                     prev.mime_type = prev.muxer.mime_type();
                 }
+                arc_bytes = Some(shared);
             }
-            (seg, prev.mime_type.clone())
+            (seg.map(|s| (s.is_init, arc_bytes.unwrap())), prev.mime_type.clone())
         };
 
-        if let (Some(seg), mime_opt) = seg_opt {
-            if seg.is_init {
+        if let (Some((is_init, seg_bytes)), mime_opt) = seg_opt {
+            if is_init {
                 if let Some(mime) = mime_opt {
-                    let note = make_preview_codec_notification(&mime);
+                    let note: Arc<str> = Arc::from(make_preview_codec_notification(&mime));
                     broadcast_msg(&self.clients, OutboundMsg::Text(note), true, false);
                 }
             }
-            broadcast_msg(&self.clients, OutboundMsg::Binary(seg.bytes), false, true);
+            broadcast_msg(&self.clients, OutboundMsg::Binary(seg_bytes), false, true);
         }
         Ok(())
     }
 
     /// 任意のテキスト JSON-RPC 通知を全制御クライアントへ送信する
     pub fn broadcast_text(&self, text: String) {
-        broadcast_msg(&self.clients, OutboundMsg::Text(text), true, false);
+        broadcast_msg(&self.clients, OutboundMsg::Text(Arc::from(text)), true, false);
     }
 
     /// サーバーを停止し、スレッドを終了する
@@ -268,6 +289,7 @@ fn handle_connection(
     stream: TcpStream,
     stop_flag: Arc<AtomicBool>,
     clients: Arc<Mutex<Vec<ClientHandle>>>,
+    preview_client_count: Arc<AtomicUsize>,
     preview: Arc<Mutex<PreviewState>>,
     backend: Arc<dyn ControlBackend>,
 ) {
@@ -301,21 +323,23 @@ fn handle_connection(
         Some(k) => k,
         None => return,
     };
-    if write_websocket_upgrade(&mut write_stream, ws_key).is_err() {
-        return;
-    }
 
     let (tx, rx) = mpsc::sync_channel::<OutboundMsg>(128);
+    let is_preview_client = matches!(role, WsRole::Unified | WsRole::PreviewOnly);
 
-    // 新規プレビュー接続時は即座に preview.codec と init.mp4 を先頭送信する
-    if matches!(role, WsRole::Unified | WsRole::PreviewOnly) {
+    // 101 Switching Protocols を返す前にクライアント登録と初期セグメント投入を完了させ、
+    // ハンドシェイク直後の push_preview_packet との競合を防ぐ
+    if is_preview_client {
+        preview_client_count.fetch_add(1, Ordering::AcqRel);
         let (init_opt, mime_opt) = {
             let g = preview.lock().unwrap();
             (g.init_segment.clone(), g.mime_type.clone())
         };
         if matches!(role, WsRole::Unified) {
             if let Some(mime) = mime_opt {
-                let _ = tx.try_send(OutboundMsg::Text(make_preview_codec_notification(&mime)));
+                let _ = tx.try_send(OutboundMsg::Text(Arc::from(
+                    make_preview_codec_notification(&mime),
+                )));
             }
         }
         if let Some(init_bytes) = init_opt {
@@ -330,6 +354,17 @@ fn handle_connection(
             role,
             tx: tx.clone(),
         });
+    }
+
+    if write_websocket_upgrade(&mut write_stream, ws_key).is_err() {
+        {
+            let mut guard = clients.lock().unwrap();
+            guard.retain(|c| c.id != client_id);
+        }
+        if is_preview_client {
+            preview_client_count.fetch_sub(1, Ordering::AcqRel);
+        }
+        return;
     }
 
     // 送信専用スレッド
@@ -371,7 +406,7 @@ fn handle_connection(
         // Note: BufReader の未読バッファ分とソケット読み取りの両方を正しく扱う
         match read_ws_message(&mut buf_reader) {
             Ok(WsMessage::Text(txt)) => {
-                let resp = handle_rpc_message(&*backend, &txt);
+                let resp: Arc<str> = Arc::from(handle_rpc_message(&*backend, &txt));
                 if tx.send(OutboundMsg::Text(resp)).is_err() {
                     break;
                 }
@@ -401,6 +436,9 @@ fn handle_connection(
     {
         let mut guard = clients.lock().unwrap();
         guard.retain(|c| c.id != client_id);
+    }
+    if is_preview_client {
+        preview_client_count.fetch_sub(1, Ordering::AcqRel);
     }
     let _ = tx.try_send(OutboundMsg::Close);
     drop(tx);

@@ -15,12 +15,14 @@ use core_types::media::{CodecKind, EncodedPacket, LayerTransform};
 use core_types::state::{PipelineState, StateMachine};
 use core_types::traits::{AudioEncoder, VideoEncoder};
 use core_types::CoreResult;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 /// Web UI JSON-RPC と `AudioMixer`（ロックフリー `ChannelHandle` / `MasterHandle`）・
 /// `GpuLayer`・`RtmpPublisher` を橋渡しする共有制御ブリッジ
 pub struct EngineControlBridge {
     inner: Arc<Mutex<BridgeInner>>,
+    has_pending_transforms: AtomicBool,
 }
 
 struct BridgeInner {
@@ -98,6 +100,7 @@ impl EngineControlBridge {
                 last_abr_decision: None,
                 last_error: None,
             })),
+            has_pending_transforms: AtomicBool::new(false),
         })
     }
 
@@ -168,8 +171,17 @@ impl EngineControlBridge {
             .unwrap_or_default()
     }
 
+    /// 待機中の `LayerTransform` 更新が存在するか（ロック不要の高速判定）
+    #[inline]
+    pub fn has_pending_transforms(&self) -> bool {
+        self.has_pending_transforms.load(Ordering::Acquire)
+    }
+
     /// 待機中の `LayerTransform` 変更を GPU レイヤー群へ反映する
     pub fn apply_pending_transforms(&self, compositor: &GpuCompositor, layers: &mut [&mut GpuLayer]) {
+        if !self.has_pending_transforms.swap(false, Ordering::AcqRel) {
+            return;
+        }
         let updates: Vec<(usize, LayerTransform)> = {
             let mut g = self.inner.lock().unwrap();
             std::mem::take(&mut g.pending_transform_updates)
@@ -446,6 +458,7 @@ impl ControlBackend for EngineControlBridge {
             });
         }
         g.pending_transform_updates.push((layer_id, transform));
+        self.has_pending_transforms.store(true, Ordering::Release);
         Ok(())
     }
 }

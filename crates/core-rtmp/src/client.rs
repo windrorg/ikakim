@@ -4,12 +4,12 @@ use crate::chunk::{
     CSID_PROTOCOL_CONTROL, CSID_VIDEO, MSG_ACK, MSG_AUDIO, MSG_COMMAND_AMF0, MSG_DATA_AMF0,
     MSG_SET_CHUNK_SIZE, MSG_SET_PEER_BANDWIDTH, MSG_USER_CONTROL, MSG_VIDEO, MSG_WINDOW_ACK_SIZE,
 };
-use crate::flv::{build_metadata_payload, pack_audio_tag, pack_video_tag};
+use crate::flv::{build_metadata_payload, pack_audio_tag_into, pack_video_tag_into};
 use crate::handshake::perform_client_handshake;
 use crate::transport::{RtmpTransport, RtmpUrl, TlsRootConfig};
 use core_types::media::{CodecKind, EncodedPacket};
 use core_types::{CoreError, CoreResult};
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::time::Duration;
 
 const OUT_CHUNK_SIZE: u32 = 4096;
@@ -39,6 +39,7 @@ pub struct RtmpClient {
     transport: RtmpTransport,
     chunk_writer: ChunkWriter,
     chunk_reader: ChunkReader,
+    tag_scratch: Vec<u8>,
     stream_id: u32,
     next_txn_id: f64,
     window_ack_size: u64,
@@ -64,6 +65,7 @@ impl RtmpClient {
             transport,
             chunk_writer: ChunkWriter::new(),
             chunk_reader: ChunkReader::new(),
+            tag_scratch: Vec::with_capacity(64 * 1024),
             stream_id: 0,
             next_txn_id: 1.0,
             window_ack_size: 2_500_000,
@@ -190,45 +192,40 @@ impl RtmpClient {
     }
 
     fn send_set_chunk_size(&mut self, size: u32) -> CoreResult<()> {
-        let payload = (size & 0x7FFF_FFFF).to_be_bytes().to_vec();
-        self.chunk_writer.write_message(
+        let payload = (size & 0x7FFF_FFFF).to_be_bytes();
+        self.chunk_writer.write_message_payload(
             &mut self.transport,
-            &RtmpMessage {
-                csid: CSID_PROTOCOL_CONTROL,
-                timestamp_ms: 0,
-                msg_type: MSG_SET_CHUNK_SIZE,
-                stream_id: 0,
-                payload,
-            },
+            CSID_PROTOCOL_CONTROL,
+            0,
+            MSG_SET_CHUNK_SIZE,
+            0,
+            &payload,
         )?;
         Ok(())
     }
 
     fn send_ack(&mut self, total_bytes: u32) -> CoreResult<()> {
-        self.chunk_writer.write_message(
+        let payload = total_bytes.to_be_bytes();
+        self.chunk_writer.write_message_payload(
             &mut self.transport,
-            &RtmpMessage {
-                csid: CSID_PROTOCOL_CONTROL,
-                timestamp_ms: 0,
-                msg_type: MSG_ACK,
-                stream_id: 0,
-                payload: total_bytes.to_be_bytes().to_vec(),
-            },
+            CSID_PROTOCOL_CONTROL,
+            0,
+            MSG_ACK,
+            0,
+            &payload,
         )?;
         Ok(())
     }
 
     fn send_command(&mut self, csid: u32, stream_id: u32, args: &[Amf0Value]) -> CoreResult<()> {
         let payload = encode_values(args);
-        self.chunk_writer.write_message(
+        self.chunk_writer.write_message_payload(
             &mut self.transport,
-            &RtmpMessage {
-                csid,
-                timestamp_ms: 0,
-                msg_type: MSG_COMMAND_AMF0,
-                stream_id,
-                payload,
-            },
+            csid,
+            0,
+            MSG_COMMAND_AMF0,
+            stream_id,
+            &payload,
         )?;
         self.transport
             .flush()
@@ -245,15 +242,14 @@ impl RtmpClient {
             MSG_SET_PEER_BANDWIDTH if msg.payload.len() >= 4 => {
                 let win =
                     u32::from_be_bytes([msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3]]);
-                self.chunk_writer.write_message(
+                let payload = win.to_be_bytes();
+                self.chunk_writer.write_message_payload(
                     &mut self.transport,
-                    &RtmpMessage {
-                        csid: CSID_PROTOCOL_CONTROL,
-                        timestamp_ms: 0,
-                        msg_type: MSG_WINDOW_ACK_SIZE,
-                        stream_id: 0,
-                        payload: win.to_be_bytes().to_vec(),
-                    },
+                    CSID_PROTOCOL_CONTROL,
+                    0,
+                    MSG_WINDOW_ACK_SIZE,
+                    0,
+                    &payload,
                 )?;
                 let _ = self.transport.flush();
             }
@@ -261,18 +257,14 @@ impl RtmpClient {
                 let event_type = u16::from_be_bytes([msg.payload[0], msg.payload[1]]);
                 if event_type == 6 {
                     // PingRequest -> PingResponse (event_type = 7)
-                    let mut pong = msg.payload[..6].to_vec();
-                    pong[0] = 0;
-                    pong[1] = 7;
-                    self.chunk_writer.write_message(
+                    let pong = [0, 7, msg.payload[2], msg.payload[3], msg.payload[4], msg.payload[5]];
+                    self.chunk_writer.write_message_payload(
                         &mut self.transport,
-                        &RtmpMessage {
-                            csid: CSID_PROTOCOL_CONTROL,
-                            timestamp_ms: 0,
-                            msg_type: MSG_USER_CONTROL,
-                            stream_id: 0,
-                            payload: pong,
-                        },
+                        CSID_PROTOCOL_CONTROL,
+                        0,
+                        MSG_USER_CONTROL,
+                        0,
+                        &pong,
                     )?;
                     let _ = self.transport.flush();
                 }
@@ -345,12 +337,19 @@ impl RtmpClient {
     }
 
     /// 映像（H.264）または音声（AAC-LC）パケットを RTMP チャンクとして送信する。
+    /// `tag_scratch` と `ChunkWriter::staging_buf` を再利用し、定常フレーム送信時のヒープ割り当てをゼロにする。
     /// 送信したワイヤバイト数を返す。
     pub fn send_packet(&mut self, packet: &EncodedPacket) -> CoreResult<usize> {
         let ts_ms = packet.dts.to_timestamp_ms().0;
-        let (csid, msg_type, payload) = match packet.codec {
-            CodecKind::H264 => (CSID_VIDEO, MSG_VIDEO, pack_video_tag(packet)?),
-            CodecKind::AacLc => (CSID_AUDIO, MSG_AUDIO, pack_audio_tag(packet)?),
+        let (csid, msg_type) = match packet.codec {
+            CodecKind::H264 => {
+                pack_video_tag_into(packet, &mut self.tag_scratch)?;
+                (CSID_VIDEO, MSG_VIDEO)
+            }
+            CodecKind::AacLc => {
+                pack_audio_tag_into(packet, &mut self.tag_scratch)?;
+                (CSID_AUDIO, MSG_AUDIO)
+            }
             other => {
                 return Err(CoreError::UnsupportedFormat(format!(
                     "RTMP does not support codec {:?}",
@@ -359,15 +358,13 @@ impl RtmpClient {
             }
         };
 
-        let written = self.chunk_writer.write_message(
+        let written = self.chunk_writer.write_message_payload(
             &mut self.transport,
-            &RtmpMessage {
-                csid,
-                timestamp_ms: ts_ms,
-                msg_type,
-                stream_id: self.stream_id,
-                payload,
-            },
+            csid,
+            ts_ms,
+            msg_type,
+            self.stream_id,
+            &self.tag_scratch,
         )?;
         self.transport
             .flush()
@@ -375,57 +372,45 @@ impl RtmpClient {
         Ok(written)
     }
 
-    /// ノンブロッキング/短タイムアウトでサーバーからの制御メッセージ（Ping/Ack/切断通知等）を処理する
+    /// ノンブロッキング/短タイムアウトでサーバーからの制御メッセージ（Ping/Ack/切断通知等）を最大8件まで一括処理する
     pub fn poll_inbound(&mut self) -> CoreResult<()> {
-        match self.chunk_reader.read_message(&mut self.transport) {
-            Ok(msg) => {
-                self.handle_control_message(&msg)?;
-                if msg.msg_type == MSG_COMMAND_AMF0 {
-                    if let Ok(vals) = decode_all(&msg.payload) {
-                        let cmd = vals.first().and_then(|v| v.as_str()).unwrap_or("");
-                        if cmd == "onStatus" {
-                            let info = vals.get(3);
-                            let level = info
-                                .and_then(|o| o.get("level"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let code = info
-                                .and_then(|o| o.get("code"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if level == "error"
-                                || code == "NetStream.Unpublish.Success"
-                                || code == "NetConnection.Connect.Closed"
-                            {
-                                return Err(CoreError::Network(format!(
-                                    "RTMP server closed stream: {} ({})",
-                                    code, level
-                                )));
-                            }
-                        } else if cmd == "_error" || cmd == "close" {
+        for _ in 0..8 {
+            let Some(msg) = self.chunk_reader.try_read_message(&mut self.transport)? else {
+                break;
+            };
+            self.handle_control_message(&msg)?;
+            if msg.msg_type == MSG_COMMAND_AMF0 {
+                if let Ok(vals) = decode_all(&msg.payload) {
+                    let cmd = vals.first().and_then(|v| v.as_str()).unwrap_or("");
+                    if cmd == "onStatus" {
+                        let info = vals.get(3);
+                        let level = info
+                            .and_then(|o| o.get("level"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let code = info
+                            .and_then(|o| o.get("code"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if level == "error"
+                            || code == "NetStream.Unpublish.Success"
+                            || code == "NetConnection.Connect.Closed"
+                        {
                             return Err(CoreError::Network(format!(
-                                "RTMP server command {}: {:?}",
-                                cmd, vals
+                                "RTMP server closed stream: {} ({})",
+                                code, level
                             )));
                         }
+                    } else if cmd == "_error" || cmd == "close" {
+                        return Err(CoreError::Network(format!(
+                            "RTMP server command {}: {:?}",
+                            cmd, vals
+                        )));
                     }
                 }
-                Ok(())
-            }
-            Err(CoreError::Network(ref s))
-                if s.contains("TimedOut")
-                    || s.contains("WouldBlock")
-                    || s.contains("timed out")
-                    || s.contains("Resource temporarily unavailable") =>
-            {
-                Ok(())
-            }
-            Err(e) => {
-                // io::ErrorKind::WouldBlock / TimedOut が文字列表現以外の場合の安全策
-                let _ = ErrorKind::TimedOut;
-                Err(e)
             }
         }
+        Ok(())
     }
 
     pub fn close(&mut self) {

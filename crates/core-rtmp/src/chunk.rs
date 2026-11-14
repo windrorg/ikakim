@@ -1,8 +1,9 @@
 use core_types::{CoreError, CoreResult};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 
 pub const DEFAULT_CHUNK_SIZE: usize = 128;
+const FAST_CSID_LIMIT: usize = 16;
 
 pub const MSG_SET_CHUNK_SIZE: u8 = 1;
 pub const MSG_ABORT: u8 = 2;
@@ -30,7 +31,7 @@ pub struct RtmpMessage {
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct OutPrevHeader {
     timestamp_ms: u32,
     stream_id: u32,
@@ -38,14 +39,18 @@ struct OutPrevHeader {
 
 pub struct ChunkWriter {
     chunk_size: usize,
+    fast_prev: [Option<OutPrevHeader>; FAST_CSID_LIMIT],
     prev_headers: HashMap<u32, OutPrevHeader>,
+    staging_buf: Vec<u8>,
 }
 
 impl ChunkWriter {
     pub fn new() -> Self {
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
+            fast_prev: [None; FAST_CSID_LIMIT],
             prev_headers: HashMap::new(),
+            staging_buf: Vec::with_capacity(16 * 1024),
         }
     }
 
@@ -57,98 +62,134 @@ impl ChunkWriter {
         self.chunk_size
     }
 
+    #[inline]
+    fn get_prev(&self, csid: u32) -> Option<OutPrevHeader> {
+        if (csid as usize) < FAST_CSID_LIMIT {
+            self.fast_prev[csid as usize]
+        } else {
+            self.prev_headers.get(&csid).copied()
+        }
+    }
+
+    #[inline]
+    fn set_prev(&mut self, csid: u32, prev: OutPrevHeader) {
+        if (csid as usize) < FAST_CSID_LIMIT {
+            self.fast_prev[csid as usize] = Some(prev);
+        } else {
+            self.prev_headers.insert(csid, prev);
+        }
+    }
+
     pub fn write_message<W: Write>(&mut self, writer: &mut W, msg: &RtmpMessage) -> CoreResult<usize> {
-        let payload_len = msg.payload.len() as u32;
-        let mut total_written = 0usize;
+        self.write_message_payload(
+            writer,
+            msg.csid,
+            msg.timestamp_ms,
+            msg.msg_type,
+            msg.stream_id,
+            &msg.payload,
+        )
+    }
+
+    /// 借用スライス `payload` をチャンク分割して内部ステージングバッファへ一括構築し、
+    /// 単一の `write_all` システムコール（および単一の TLS レコード）で送信する
+    pub fn write_message_payload<W: Write>(
+        &mut self,
+        writer: &mut W,
+        csid: u32,
+        timestamp_ms: u32,
+        msg_type: u8,
+        stream_id: u32,
+        payload: &[u8],
+    ) -> CoreResult<usize> {
+        let payload_len = payload.len() as u32;
+        let num_chunks = payload.len().div_ceil(self.chunk_size).max(1);
+        self.staging_buf.clear();
+        self.staging_buf.reserve(payload.len() + num_chunks * 18);
+
         let mut offset = 0usize;
         let mut msg_ext_ts: Option<u32> = None;
 
-        while offset < msg.payload.len() || (msg.payload.is_empty() && offset == 0) {
-            let chunk_len = (msg.payload.len() - offset).min(self.chunk_size);
+        while offset < payload.len() || (payload.is_empty() && offset == 0) {
+            let chunk_len = (payload.len() - offset).min(self.chunk_size);
             let mut hdr = [0u8; 18];
             let mut hdr_len: usize;
 
             if offset == 0 {
                 // Fmt 0 または Fmt 1 で送信
-                let use_fmt1 = if let Some(prev) = self.prev_headers.get(&msg.csid) {
-                    prev.stream_id == msg.stream_id && msg.timestamp_ms >= prev.timestamp_ms
-                } else {
-                    false
-                };
+                let prev_opt = self.get_prev(csid);
+                let use_fmt1 = prev_opt
+                    .is_some_and(|prev| prev.stream_id == stream_id && timestamp_ms >= prev.timestamp_ms);
 
-                if use_fmt1 {
-                    let prev = &self.prev_headers[&msg.csid];
-                    let delta = msg.timestamp_ms.wrapping_sub(prev.timestamp_ms);
-                    hdr_len = encode_basic_header_buf(1, msg.csid, &mut hdr);
+                if let (true, Some(prev)) = (use_fmt1, prev_opt) {
+                    let delta = timestamp_ms.wrapping_sub(prev.timestamp_ms);
+                    hdr_len = encode_basic_header_buf(1, csid, &mut hdr);
                     let ts_field = if delta >= 0x00FF_FFFF { 0x00FF_FFFF } else { delta };
                     hdr[hdr_len..hdr_len + 3].copy_from_slice(&ts_field.to_be_bytes()[1..4]);
                     hdr[hdr_len + 3..hdr_len + 6].copy_from_slice(&payload_len.to_be_bytes()[1..4]);
-                    hdr[hdr_len + 6] = msg.msg_type;
+                    hdr[hdr_len + 6] = msg_type;
                     hdr_len += 7;
                     if delta >= 0x00FF_FFFF {
                         hdr[hdr_len..hdr_len + 4].copy_from_slice(&delta.to_be_bytes());
                         hdr_len += 4;
                         msg_ext_ts = Some(delta);
                     }
-                    self.prev_headers.insert(
-                        msg.csid,
+                    self.set_prev(
+                        csid,
                         OutPrevHeader {
-                            timestamp_ms: msg.timestamp_ms,
-                            stream_id: msg.stream_id,
+                            timestamp_ms,
+                            stream_id,
                         },
                     );
                 } else {
-                    hdr_len = encode_basic_header_buf(0, msg.csid, &mut hdr);
-                    let ts_field = if msg.timestamp_ms >= 0x00FF_FFFF {
+                    hdr_len = encode_basic_header_buf(0, csid, &mut hdr);
+                    let ts_field = if timestamp_ms >= 0x00FF_FFFF {
                         0x00FF_FFFF
                     } else {
-                        msg.timestamp_ms
+                        timestamp_ms
                     };
                     hdr[hdr_len..hdr_len + 3].copy_from_slice(&ts_field.to_be_bytes()[1..4]);
                     hdr[hdr_len + 3..hdr_len + 6].copy_from_slice(&payload_len.to_be_bytes()[1..4]);
-                    hdr[hdr_len + 6] = msg.msg_type;
-                    hdr[hdr_len + 7..hdr_len + 11].copy_from_slice(&msg.stream_id.to_le_bytes());
+                    hdr[hdr_len + 6] = msg_type;
+                    hdr[hdr_len + 7..hdr_len + 11].copy_from_slice(&stream_id.to_le_bytes());
                     hdr_len += 11;
-                    if msg.timestamp_ms >= 0x00FF_FFFF {
-                        hdr[hdr_len..hdr_len + 4].copy_from_slice(&msg.timestamp_ms.to_be_bytes());
+                    if timestamp_ms >= 0x00FF_FFFF {
+                        hdr[hdr_len..hdr_len + 4].copy_from_slice(&timestamp_ms.to_be_bytes());
                         hdr_len += 4;
-                        msg_ext_ts = Some(msg.timestamp_ms);
+                        msg_ext_ts = Some(timestamp_ms);
                     }
-                    self.prev_headers.insert(
-                        msg.csid,
+                    self.set_prev(
+                        csid,
                         OutPrevHeader {
-                            timestamp_ms: msg.timestamp_ms,
-                            stream_id: msg.stream_id,
+                            timestamp_ms,
+                            stream_id,
                         },
                     );
                 }
             } else {
                 // Fmt 3 continuation: 先頭チャンク (offset == 0) が拡張タイムスタンプを伴った場合のみ再送
-                hdr_len = encode_basic_header_buf(3, msg.csid, &mut hdr);
+                hdr_len = encode_basic_header_buf(3, csid, &mut hdr);
                 if let Some(ext_ts) = msg_ext_ts {
                     hdr[hdr_len..hdr_len + 4].copy_from_slice(&ext_ts.to_be_bytes());
                     hdr_len += 4;
                 }
             }
 
-            writer
-                .write_all(&hdr[..hdr_len])
-                .map_err(|e| CoreError::Network(format!("RTMP write header error: {}", e)))?;
-            total_written += hdr_len;
-
+            self.staging_buf.extend_from_slice(&hdr[..hdr_len]);
             if chunk_len > 0 {
-                writer
-                    .write_all(&msg.payload[offset..offset + chunk_len])
-                    .map_err(|e| CoreError::Network(format!("RTMP write payload error: {}", e)))?;
-                total_written += chunk_len;
+                self.staging_buf
+                    .extend_from_slice(&payload[offset..offset + chunk_len]);
             }
             offset += chunk_len;
-            if msg.payload.is_empty() {
+            if payload.is_empty() {
                 break;
             }
         }
 
-        Ok(total_written)
+        writer
+            .write_all(&self.staging_buf)
+            .map_err(|e| CoreError::Network(format!("RTMP write message error: {}", e)))?;
+        Ok(self.staging_buf.len())
     }
 }
 
@@ -190,6 +231,7 @@ struct InChunkState {
 
 pub struct ChunkReader {
     chunk_size: usize,
+    fast_streams: [InChunkState; FAST_CSID_LIMIT],
     streams: HashMap<u32, InChunkState>,
     bytes_received: u64,
 }
@@ -198,6 +240,7 @@ impl ChunkReader {
     pub fn new() -> Self {
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
+            fast_streams: std::array::from_fn(|_| InChunkState::default()),
             streams: HashMap::new(),
             bytes_received: 0,
         }
@@ -221,14 +264,36 @@ impl ChunkReader {
         Ok(())
     }
 
-    pub fn read_message<R: Read>(&mut self, reader: &mut R) -> CoreResult<RtmpMessage> {
-        loop {
-            let mut b0 = [0u8; 1];
-            Self::read_exact_counted(&mut self.bytes_received, reader, &mut b0)
-                .map_err(|e| CoreError::Network(format!("RTMP read chunk header error: {}", e)))?;
+    /// ノンブロッキング/短タイムアウト受信用: 先頭バイトが `WouldBlock`/`TimedOut` ならヒープ確保なしで `Ok(None)` を返す
+    pub fn try_read_message<R: Read>(&mut self, reader: &mut R) -> CoreResult<Option<RtmpMessage>> {
+        let mut b0 = [0u8; 1];
+        match Self::read_exact_counted(&mut self.bytes_received, reader, &mut b0) {
+            Ok(()) => self.read_message_after_b0(reader, b0[0]).map(Some),
+            Err(ref e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                Ok(None)
+            }
+            Err(e) => Err(CoreError::Network(format!(
+                "RTMP read chunk header error: {}",
+                e
+            ))),
+        }
+    }
 
-            let fmt = (b0[0] >> 6) & 0x03;
-            let csid_low = (b0[0] & 0x3F) as u32;
+    pub fn read_message<R: Read>(&mut self, reader: &mut R) -> CoreResult<RtmpMessage> {
+        let mut b0 = [0u8; 1];
+        Self::read_exact_counted(&mut self.bytes_received, reader, &mut b0)
+            .map_err(|e| CoreError::Network(format!("RTMP read chunk header error: {}", e)))?;
+        self.read_message_after_b0(reader, b0[0])
+    }
+
+    fn read_message_after_b0<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut first_byte: u8,
+    ) -> CoreResult<RtmpMessage> {
+        loop {
+            let fmt = (first_byte >> 6) & 0x03;
+            let csid_low = (first_byte & 0x3F) as u32;
             let csid = match csid_low {
                 0 => {
                     let mut b1 = [0u8; 1];
@@ -246,7 +311,11 @@ impl ChunkReader {
             };
 
             let bytes_received = &mut self.bytes_received;
-            let state = self.streams.entry(csid).or_default();
+            let state = if (csid as usize) < FAST_CSID_LIMIT {
+                &mut self.fast_streams[csid as usize]
+            } else {
+                self.streams.entry(csid).or_default()
+            };
 
             match fmt {
                 0 => {
@@ -361,6 +430,11 @@ impl ChunkReader {
                 }
                 return Ok(msg);
             }
+
+            let mut next_b0 = [0u8; 1];
+            Self::read_exact_counted(&mut self.bytes_received, reader, &mut next_b0)
+                .map_err(|e| CoreError::Network(format!("RTMP read continuation header error: {}", e)))?;
+            first_byte = next_b0[0];
         }
     }
 }

@@ -716,3 +716,90 @@ fn test_property_annexb_to_avcc_and_abr_invariants() {
         }
     }
 }
+
+#[test]
+fn test_chunk_writer_single_write_coalescing_and_nonblocking_try_read() {
+    use core_rtmp::flv::{pack_audio_tag_into, pack_video_tag_into};
+    use std::io::{self, Read, Write};
+
+    struct CountingWriter {
+        buf: Vec<u8>,
+        write_calls: usize,
+    }
+    impl Write for CountingWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.write_calls += 1;
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct WouldBlockReader;
+    impl Read for WouldBlockReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "would block"))
+        }
+    }
+
+    // 1. 100 KB の映像メッセージを 4096B チャンク (25 チャンク) に分割しても write_all が 1 回に集約されること
+    let mut writer = ChunkWriter::new();
+    writer.set_chunk_size(4096);
+    let mut cw = CountingWriter {
+        buf: Vec::new(),
+        write_calls: 0,
+    };
+
+    let mut tag_scratch = Vec::with_capacity(128 * 1024);
+    let mut nalu = vec![0x00, 0x00, 0x00, 0x01, 0x65];
+    nalu.resize(100_000, 0x42);
+    let v_pkt = EncodedPacket {
+        codec: CodecKind::H264,
+        pts: PtsUs(33_333),
+        dts: PtsUs(16_667),
+        is_keyframe: true,
+        is_sequence_header: false,
+        data: nalu,
+    };
+    pack_video_tag_into(&v_pkt, &mut tag_scratch).unwrap();
+    assert_eq!(tag_scratch, pack_video_tag(&v_pkt).unwrap());
+
+    writer
+        .write_message_payload(&mut cw, CSID_VIDEO, 16, MSG_VIDEO, 1, &tag_scratch)
+        .unwrap();
+    assert_eq!(
+        cw.write_calls, 1,
+        "25 chunks must be coalesced into 1 write syscall"
+    );
+
+    // 同じ tag_scratch を音声タグ生成に再利用してもアロケーションなしで一致すること
+    let a_pkt = EncodedPacket {
+        codec: CodecKind::AacLc,
+        pts: PtsUs(21_333),
+        dts: PtsUs(21_333),
+        is_keyframe: true,
+        is_sequence_header: false,
+        data: vec![0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C],
+    };
+    let cap_before = tag_scratch.capacity();
+    pack_audio_tag_into(&a_pkt, &mut tag_scratch).unwrap();
+    assert_eq!(tag_scratch.capacity(), cap_before);
+    assert_eq!(tag_scratch, pack_audio_tag(&a_pkt).unwrap());
+
+    // 2. try_read_message: 読み取り可能メッセージは Some(msg)、WouldBlock 時はエラー文字列生成なしで Ok(None)
+    let mut reader = ChunkReader::new();
+    reader.set_chunk_size(4096);
+    let mut cursor = Cursor::new(cw.buf);
+    let msg = reader
+        .try_read_message(&mut cursor)
+        .unwrap()
+        .expect("message expected");
+    assert_eq!(msg.csid, CSID_VIDEO);
+    assert_eq!(msg.timestamp_ms, 16);
+    assert_eq!(msg.payload, pack_video_tag(&v_pkt).unwrap());
+
+    let mut wb = WouldBlockReader;
+    assert_eq!(reader.try_read_message(&mut wb).unwrap(), None);
+}

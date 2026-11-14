@@ -511,3 +511,60 @@ fn test_property_ws_framing_and_fmp4_box_integrity() {
         pts_us += 16_667;
     }
 }
+
+#[test]
+fn test_ws_64bit_mask_and_single_write_small_frame_coalescing() {
+    use core_net_ui::ws::apply_ws_mask;
+    use std::io;
+
+    let mut rng = SplitMix64(0x1122_3344_5566_7788);
+    // 0..=300 バイトの全端数長で 64-bit ワード XOR マスクが 1 バイト毎の定義と完全一致し、2回適用で元に戻ること
+    for len in 0..=300 {
+        let orig: Vec<u8> = (0..len).map(|_| (rng.next_u64() & 0xFF) as u8).collect();
+        let key = [
+            (rng.next_u64() & 0xFF) as u8,
+            ((rng.next_u64() >> 8) & 0xFF) as u8,
+            ((rng.next_u64() >> 16) & 0xFF) as u8,
+            ((rng.next_u64() >> 24) & 0xFF) as u8,
+        ];
+        let mut expected = orig.clone();
+        for (i, b) in expected.iter_mut().enumerate() {
+            *b ^= key[i & 3];
+        }
+
+        let mut actual = orig.clone();
+        apply_ws_mask(&mut actual, key);
+        assert_eq!(actual, expected, "mask mismatch at len={}", len);
+
+        apply_ws_mask(&mut actual, key);
+        assert_eq!(actual, orig, "unmask roundtrip mismatch at len={}", len);
+    }
+
+    // <= 2048B のサーバーフレームは 1 回の write コールに集約されること
+    struct CountingWriter {
+        buf: Vec<u8>,
+        writes: usize,
+    }
+    impl Write for CountingWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    for &sz in &[0usize, 64, 125, 126, 512, 2048] {
+        let mut cw = CountingWriter {
+            buf: Vec::new(),
+            writes: 0,
+        };
+        let payload = vec![b'x'; sz];
+        write_server_frame(&mut cw, WsOpcode::Text, &payload).unwrap();
+        assert_eq!(cw.writes, 1, "expected single write for payload len={}", sz);
+        let msg = read_ws_message(&mut Cursor::new(cw.buf)).unwrap();
+        assert_eq!(msg, WsMessage::Text("x".repeat(sz)));
+    }
+}

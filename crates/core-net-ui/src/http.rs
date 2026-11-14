@@ -30,9 +30,17 @@ impl HttpRequest {
             .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
         let has_conn = self
             .header("connection")
-            .is_some_and(|v| v.to_ascii_lowercase().contains("upgrade"));
+            .is_some_and(|v| contains_ignore_ascii_case(v, b"upgrade"));
         has_upgrade && has_conn && self.header("sec-websocket-key").is_some()
     }
+}
+
+#[inline]
+fn contains_ignore_ascii_case(haystack: &str, needle: &[u8]) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// HTTP/1.1 リクエスト行とヘッダ部を読み取る

@@ -201,13 +201,18 @@ impl CVPixelBufferWrapper {
             let dst_base = CVPixelBufferGetBaseAddress(wrapper.raw);
             let dst_stride = CVPixelBufferGetBytesPerRow(wrapper.raw);
             let src_stride = (width as usize) * 4;
-            for row in 0..height as usize {
-                let src_row = &bgra_data[row * src_stride..(row + 1) * src_stride];
-                ptr::copy_nonoverlapping(
-                    src_row.as_ptr(),
-                    dst_base.add(row * dst_stride),
-                    src_stride,
-                );
+            let h = height as usize;
+            if dst_stride == src_stride {
+                ptr::copy_nonoverlapping(bgra_data.as_ptr(), dst_base, src_stride * h);
+            } else {
+                for row in 0..h {
+                    let src_row = &bgra_data[row * src_stride..(row + 1) * src_stride];
+                    ptr::copy_nonoverlapping(
+                        src_row.as_ptr(),
+                        dst_base.add(row * dst_stride),
+                        src_stride,
+                    );
+                }
             }
             CVPixelBufferUnlockBaseAddress(wrapper.raw, 0);
             Ok(wrapper)
@@ -240,23 +245,33 @@ impl CVPixelBufferWrapper {
             let y_dst = CVPixelBufferGetBaseAddressOfPlane(wrapper.raw, 0);
             let y_dst_stride = CVPixelBufferGetBytesPerRowOfPlane(wrapper.raw, 0);
             let y_src_stride = width as usize;
-            for row in 0..height as usize {
-                ptr::copy_nonoverlapping(
-                    y_plane[row * y_src_stride..(row + 1) * y_src_stride].as_ptr(),
-                    y_dst.add(row * y_dst_stride),
-                    y_src_stride,
-                );
+            let h = height as usize;
+            if y_dst_stride == y_src_stride {
+                ptr::copy_nonoverlapping(y_plane.as_ptr(), y_dst, y_src_stride * h);
+            } else {
+                for row in 0..h {
+                    ptr::copy_nonoverlapping(
+                        y_plane[row * y_src_stride..(row + 1) * y_src_stride].as_ptr(),
+                        y_dst.add(row * y_dst_stride),
+                        y_src_stride,
+                    );
+                }
             }
 
             let uv_dst = CVPixelBufferGetBaseAddressOfPlane(wrapper.raw, 1);
             let uv_dst_stride = CVPixelBufferGetBytesPerRowOfPlane(wrapper.raw, 1);
             let uv_src_stride = width as usize;
-            for row in 0..(height as usize / 2) {
-                ptr::copy_nonoverlapping(
-                    uv_plane[row * uv_src_stride..(row + 1) * uv_src_stride].as_ptr(),
-                    uv_dst.add(row * uv_dst_stride),
-                    uv_src_stride,
-                );
+            let uv_h = h / 2;
+            if uv_dst_stride == uv_src_stride {
+                ptr::copy_nonoverlapping(uv_plane.as_ptr(), uv_dst, uv_src_stride * uv_h);
+            } else {
+                for row in 0..uv_h {
+                    ptr::copy_nonoverlapping(
+                        uv_plane[row * uv_src_stride..(row + 1) * uv_src_stride].as_ptr(),
+                        uv_dst.add(row * uv_dst_stride),
+                        uv_src_stride,
+                    );
+                }
             }
             CVPixelBufferUnlockBaseAddress(wrapper.raw, 0);
             Ok(wrapper)
@@ -536,6 +551,7 @@ fn cv_metal_tex_iosurface_ptr(cv_tex: CVMetalTextureRef) -> *const c_void {
         fn objc_msgSend();
         fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
     }
+    static IOSURFACE_SEL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     if cv_tex.is_null() {
         return ptr::null();
     }
@@ -544,9 +560,10 @@ fn cv_metal_tex_iosurface_ptr(cv_tex: CVMetalTextureRef) -> *const c_void {
         if mtl_ptr.is_null() {
             return ptr::null();
         }
+        let sel = *IOSURFACE_SEL.get_or_init(|| sel_registerName(c"iosurface".as_ptr()) as usize)
+            as *mut c_void;
         let msg_send: extern "C" fn(*mut c_void, *mut c_void) -> *const c_void =
             std::mem::transmute(objc_msgSend as *const ());
-        let sel = sel_registerName(c"iosurface".as_ptr());
         msg_send(mtl_ptr, sel)
     }
 }

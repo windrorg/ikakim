@@ -46,6 +46,24 @@ pub struct RawWsFrame {
     pub payload: Vec<u8>,
 }
 
+/// 64-bit ワード一括処理で RFC 6455 WebSocket マスク/マスク解除（XOR）をインプレース適用する
+#[inline]
+pub fn apply_ws_mask(payload: &mut [u8], key: [u8; 4]) {
+    let key64 = u64::from_ne_bytes([
+        key[0], key[1], key[2], key[3], key[0], key[1], key[2], key[3],
+    ]);
+    let mut chunks = payload.chunks_exact_mut(8);
+    for chunk in &mut chunks {
+        let word = u64::from_ne_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        chunk.copy_from_slice(&(word ^ key64).to_ne_bytes());
+    }
+    for (i, b) in chunks.into_remainder().iter_mut().enumerate() {
+        *b ^= key[i & 3];
+    }
+}
+
 /// ストリームから 1 つの WebSocket フレームを読み取る（マスク解除含む）
 pub fn read_raw_frame<R: Read>(reader: &mut R) -> CoreResult<RawWsFrame> {
     let mut header = [0u8; 2];
@@ -100,9 +118,7 @@ pub fn read_raw_frame<R: Read>(reader: &mut R) -> CoreResult<RawWsFrame> {
     }
 
     if let Some(k) = mask_key {
-        for (i, b) in payload.iter_mut().enumerate() {
-            *b ^= k[i % 4];
-        }
+        apply_ws_mask(&mut payload, k);
     }
 
     Ok(RawWsFrame {
@@ -178,34 +194,51 @@ fn write_frame_internal<W: Write>(
     payload: &[u8],
     mask_key: Option<[u8; 4]>,
 ) -> CoreResult<()> {
-    let mut hdr = Vec::with_capacity(14);
-    hdr.push(0x80 | (opcode as u8));
+    let mut hdr = [0u8; 14];
+    hdr[0] = 0x80 | (opcode as u8);
     let mask_bit = if mask_key.is_some() { 0x80u8 } else { 0x00u8 };
     let len = payload.len();
-    if len < 126 {
-        hdr.push(mask_bit | (len as u8));
+    let mut hdr_len = if len < 126 {
+        hdr[1] = mask_bit | (len as u8);
+        2
     } else if len <= 0xFFFF {
-        hdr.push(mask_bit | 126);
-        hdr.extend_from_slice(&(len as u16).to_be_bytes());
+        hdr[1] = mask_bit | 126;
+        hdr[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        4
     } else {
-        hdr.push(mask_bit | 127);
-        hdr.extend_from_slice(&(len as u64).to_be_bytes());
-    }
+        hdr[1] = mask_bit | 127;
+        hdr[2..10].copy_from_slice(&(len as u64).to_be_bytes());
+        10
+    };
 
     if let Some(k) = mask_key {
-        hdr.extend_from_slice(&k);
+        hdr[hdr_len..hdr_len + 4].copy_from_slice(&k);
+        hdr_len += 4;
+    }
+
+    // 30Hz メーター通知や JSON-RPC 応答などの小サイズ（<= 2048B）非マスクフレームは
+    // スタック上でヘッダとペイロードを結合し 1 回の write_all に集約する
+    if mask_key.is_none() && len <= 2048 {
+        let mut combined = [0u8; 14 + 2048];
+        combined[..hdr_len].copy_from_slice(&hdr[..hdr_len]);
+        combined[hdr_len..hdr_len + len].copy_from_slice(payload);
+        writer
+            .write_all(&combined[..hdr_len + len])
+            .map_err(|e| CoreError::Network(format!("ws write combined frame: {}", e)))?;
+        writer
+            .flush()
+            .map_err(|e| CoreError::Network(format!("ws flush: {}", e)))?;
+        return Ok(());
     }
 
     writer
-        .write_all(&hdr)
+        .write_all(&hdr[..hdr_len])
         .map_err(|e| CoreError::Network(format!("ws write header: {}", e)))?;
 
     if !payload.is_empty() {
         if let Some(k) = mask_key {
             let mut masked = payload.to_vec();
-            for (i, b) in masked.iter_mut().enumerate() {
-                *b ^= k[i % 4];
-            }
+            apply_ws_mask(&mut masked, k);
             writer
                 .write_all(&masked)
                 .map_err(|e| CoreError::Network(format!("ws write masked payload: {}", e)))?;

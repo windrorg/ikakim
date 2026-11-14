@@ -171,6 +171,7 @@ fn macos_main(args: &[String]) {
     let mut prev_enc =
         VtH264Encoder::new(prev_width, prev_height, fps.min(30), 800_000).expect("VT prev enc");
     let mut aud_enc = AudioToolboxAacEncoder::new(128_000).expect("AAC enc");
+    let mut src_pcm_buf = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
     let mut mix_buf = vec![0.0f32; MIX_BLOCK_FRAMES * 2];
 
     // Pre-allocate IOSurface-backed camera ring so zero CPU pixel synthesis pollutes 60fps loop timing
@@ -238,8 +239,8 @@ fn macos_main(args: &[String]) {
 
         let blocks = VirtualAudioSource::mix_blocks_for_fps_frame(fps, i);
         for _ in 0..blocks {
-            let pcm = a_src.next_stereo_f32(MIX_BLOCK_FRAMES);
-            prod0.push_f32(&pcm);
+            a_src.fill_stereo_f32(&mut src_pcm_buf);
+            prod0.push_f32(&src_pcm_buf);
             let st = mixer.mix_block(&mut mix_buf);
             aud_enc
                 .push_pcm_f32(&mix_buf, st.to_pts_us())

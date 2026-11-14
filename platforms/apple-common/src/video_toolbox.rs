@@ -326,29 +326,27 @@ extern "C" fn vt_encode_callback(
             return;
         }
 
-        // AVCC (4-byte big-endian length prefix) -> Annex B (00 00 00 01)
-        let mut annex_b = Vec::with_capacity(total_len + 16);
+        // AVCC (4-byte big-endian length prefix) -> Annex B (00 00 00 01) インプレース変換（追加アロケーション・コピーなし）
         let mut pos = 0usize;
         while pos + 4 <= raw.len() {
             let nalu_len = u32::from_be_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]])
                 as usize;
-            pos += 4;
-            if nalu_len == 0 || pos + nalu_len > raw.len() {
+            if nalu_len == 0 || pos + 4 + nalu_len > raw.len() {
                 break;
             }
-            annex_b.extend_from_slice(&[0, 0, 0, 1]);
-            annex_b.extend_from_slice(&raw[pos..pos + nalu_len]);
-            pos += nalu_len;
+            raw[pos..pos + 4].copy_from_slice(&[0, 0, 0, 1]);
+            pos += 4 + nalu_len;
         }
+        raw.truncate(pos);
 
-        if !annex_b.is_empty() {
+        if !raw.is_empty() {
             guard.packets.push_back(EncodedPacket {
                 codec: CodecKind::H264,
                 pts,
                 dts: pts,
                 is_keyframe,
                 is_sequence_header: false,
-                data: annex_b,
+                data: raw,
             });
         }
     }
