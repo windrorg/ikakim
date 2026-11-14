@@ -118,7 +118,17 @@ pub struct GpuContext {
 impl GpuContext {
     /// ヘッドレスコンポジタ向けの `GpuContext` を生成する（Metal / Vulkan / GL へ自動フォールバック）
     pub fn new_headless() -> CoreResult<Self> {
-        let instance = Instance::new(InstanceDescriptor::default());
+        // PowerVR Vulkan drivers (e.g. Pixel 11 Pro Fold) abort inside `LLVMDIWriter::Init`
+        // when wgpu emits SPIR-V DebugInfo in debug builds (`InstanceFlags::DEBUG`).
+        let instance_flags = if cfg!(target_os = "android") {
+            wgpu::InstanceFlags::empty()
+        } else {
+            wgpu::InstanceFlags::from_build_config()
+        };
+        let instance = Instance::new(InstanceDescriptor {
+            flags: instance_flags,
+            ..Default::default()
+        });
         let adapter_opt = block_on(instance.request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::HighPerformance,
             compatible_surface: None,

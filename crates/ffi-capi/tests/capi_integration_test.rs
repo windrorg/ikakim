@@ -226,9 +226,11 @@ fn capi_1080p60_apple_zero_copy_engine_test() {
 #[test]
 fn capi_portable_jni_create_and_destroy_smoke() {
     let raw = portable_create(64, 64, 32, 32, 30, 1_500_000, 0);
-    assert!(raw > 0);
+    // Android arm64 MTE/TBI tags the top byte of heap pointers (e.g. 0xb4...), making signed i64 negative.
+    assert_ne!(raw, 0);
     unsafe {
         let h = ffi_capi::android_jni::jlong_to_handle(raw);
+        assert!(!h.is_null());
         assert!(ikakim_engine_ui_port(h) > 0);
         ikakim_engine_destroy(h);
     }

@@ -38,6 +38,7 @@ fi
 export CC_aarch64_linux_android="$CLANG_BIN"
 export AR_aarch64_linux_android="$AR_BIN"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG_BIN"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="${CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS:-} -C link-arg=-Wl,-z,max-page-size=16384"
 export PATH="$LLVM_BIN:$PATH"
 
 CARGO_FLAGS=()

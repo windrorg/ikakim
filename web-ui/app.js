@@ -398,7 +398,9 @@
 
   function initMse(mime) {
     if (mime) activeMime = mime;
-    if (!("MediaSource" in window) || !MediaSource.isTypeSupported(activeMime)) {
+    const MS = window.MediaSource || window.ManagedMediaSource;
+    const isManaged = Boolean(window.ManagedMediaSource && MS === window.ManagedMediaSource);
+    if (!MS || !MS.isTypeSupported(activeMime)) {
       codecLabel.textContent = "MSE unsupported (" + activeMime + ")";
       return;
     }
@@ -407,11 +409,19 @@
     try {
       if (mediaSource && mediaSource.readyState === "open") mediaSource.endOfStream();
     } catch (_) {}
-    mediaSource = new MediaSource();
+    mediaSource = new MS();
     sourceBuffer = null;
-    if (activeBlobUrl) URL.revokeObjectURL(activeBlobUrl);
-    activeBlobUrl = URL.createObjectURL(mediaSource);
-    videoEl.src = activeBlobUrl;
+    if (activeBlobUrl) {
+      URL.revokeObjectURL(activeBlobUrl);
+      activeBlobUrl = null;
+    }
+    if (isManaged) {
+      videoEl.disableRemotePlayback = true;
+      videoEl.srcObject = mediaSource;
+    } else {
+      activeBlobUrl = URL.createObjectURL(mediaSource);
+      videoEl.src = activeBlobUrl;
+    }
     mediaSource.addEventListener("sourceopen", () => {
       try {
         sourceBuffer = mediaSource.addSourceBuffer(activeMime);

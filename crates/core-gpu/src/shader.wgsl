@@ -62,39 +62,23 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOut {
 }
 
 fn yuv_to_rgb(y_raw: f32, u_raw: f32, v_raw: f32, cs: u32) -> vec3<f32> {
-    var y: f32;
-    var cb: f32;
-    var cr: f32;
+    let is_limited = (cs == 0u || cs == 1u);
+    let y = select(y_raw, (y_raw - (16.0 / 255.0)) * (255.0 / 219.0), is_limited);
+    let cb = select(u_raw - (128.0 / 255.0), (u_raw - (128.0 / 255.0)) * (255.0 / 224.0), is_limited);
+    let cr = select(v_raw - (128.0 / 255.0), (v_raw - (128.0 / 255.0)) * (255.0 / 224.0), is_limited);
 
-    if (cs == 0u || cs == 1u) {
-        // Studio / Limited range (Y: 16..235, UV: 16..240)
-        y = (y_raw - (16.0 / 255.0)) * (255.0 / 219.0);
-        cb = (u_raw - (128.0 / 255.0)) * (255.0 / 224.0);
-        cr = (v_raw - (128.0 / 255.0)) * (255.0 / 224.0);
-    } else {
-        // Full range (0..255)
-        y = y_raw;
-        cb = u_raw - (128.0 / 255.0);
-        cr = v_raw - (128.0 / 255.0);
-    }
-
-    var rgb: vec3<f32>;
-    if (cs == 0u || cs == 2u) {
-        // BT.709
-        rgb = vec3<f32>(
-            y + 1.5748 * cr,
-            y - 0.187324 * cb - 0.468124 * cr,
-            y + 1.8556 * cb
-        );
-    } else {
-        // BT.601
-        rgb = vec3<f32>(
-            y + 1.402 * cr,
-            y - 0.344136 * cb - 0.714136 * cr,
-            y + 1.772 * cb
-        );
-    }
-    return clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    let is_bt709 = (cs == 0u || cs == 2u);
+    let rgb709 = vec3<f32>(
+        y + 1.5748 * cr,
+        y - 0.187324 * cb - 0.468124 * cr,
+        y + 1.8556 * cb
+    );
+    let rgb601 = vec3<f32>(
+        y + 1.402 * cr,
+        y - 0.344136 * cb - 0.714136 * cr,
+        y + 1.772 * cb
+    );
+    return clamp(select(rgb601, rgb709, is_bt709), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 fn sample_nv12(uv: vec2<f32>, cs: u32) -> vec3<f32> {
@@ -119,41 +103,29 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let h = max(u_layer.params.w, 2.0);
     let half_texel_y = 0.5 / h;
 
-    if (kind == 0u) {
-        // Straight/Premult RGBA texture
-        let c = textureSampleLevel(tex_plane0, tex_sampler, in.uv, 0.0);
-        let a = c.a * opacity;
-        return vec4<f32>(c.rgb * a, a);
-    } else if (kind == 1u) {
-        // NV12
-        let rgb = sample_nv12(in.uv, cs);
-        return vec4<f32>(rgb * opacity, opacity);
-    } else if (kind == 2u) {
-        // YUYV Dual-View
-        let rgb = sample_yuyv_dual(in.uv, cs);
-        return vec4<f32>(rgb * opacity, opacity);
-    } else if (kind == 3u) {
-        // Top-Bottom Packed Alpha (RGBA: top half RGB, bottom half Alpha mask)
-        let uv_rgb = vec2<f32>(in.uv.x, clamp(in.uv.y * 0.5, 0.0, 0.5 - half_texel_y));
-        let uv_alpha = vec2<f32>(in.uv.x, clamp(0.5 + in.uv.y * 0.5, 0.5 + half_texel_y, 1.0));
-        let rgb = textureSampleLevel(tex_plane0, tex_sampler, uv_rgb, 0.0).rgb;
-        let alpha_sample = textureSampleLevel(tex_plane0, tex_sampler, uv_alpha, 0.0).rgb;
-        let mask_a = clamp(alpha_sample.r, 0.0, 1.0);
-        let a = mask_a * opacity;
-        return vec4<f32>(rgb * a, a);
-    } else {
-        // Top-Bottom Packed Alpha (NV12: top half RGB YUV, bottom half Alpha luma)
-        let uv_rgb = vec2<f32>(in.uv.x, clamp(in.uv.y * 0.5, 0.0, 0.5 - half_texel_y));
-        let uv_alpha = vec2<f32>(in.uv.x, clamp(0.5 + in.uv.y * 0.5, 0.5 + half_texel_y, 1.0));
-        let rgb = sample_nv12(uv_rgb, cs);
-        let mask_y = textureSampleLevel(tex_plane0, tex_sampler, uv_alpha, 0.0).r;
-        var mask_a: f32;
-        if (cs == 0u || cs == 1u) {
-            mask_a = clamp((mask_y - (16.0 / 255.0)) * (255.0 / 219.0), 0.0, 1.0);
-        } else {
-            mask_a = clamp(mask_y, 0.0, 1.0);
-        }
-        let a = mask_a * opacity;
-        return vec4<f32>(rgb * a, a);
-    }
+    let is_tb = (kind >= 3u);
+    let uv_tb_rgb = vec2<f32>(in.uv.x, clamp(in.uv.y * 0.5, 0.0, 0.5 - half_texel_y));
+    let uv_rgb = select(in.uv, uv_tb_rgb, is_tb);
+    let uv_alpha = vec2<f32>(in.uv.x, clamp(0.5 + in.uv.y * 0.5, 0.5 + half_texel_y, 1.0));
+
+    let p0_rgb = textureSampleLevel(tex_plane0, tex_sampler, uv_rgb, 0.0);
+    let p1_rgb = textureSampleLevel(tex_plane1, tex_sampler, uv_rgb, 0.0);
+    let p0_alpha = textureSampleLevel(tex_plane0, tex_sampler, uv_alpha, 0.0);
+
+    let is_yuyv = (kind == 2u);
+    let yuv_u = select(p1_rgb.r, p1_rgb.g, is_yuyv);
+    let yuv_v = select(p1_rgb.g, p1_rgb.a, is_yuyv);
+    let yuv_rgb = yuv_to_rgb(p0_rgb.r, yuv_u, yuv_v, cs);
+
+    let is_rgba_kind = (kind == 0u || kind == 3u);
+    let base_rgb = select(yuv_rgb, p0_rgb.rgb, is_rgba_kind);
+
+    let mask_limited = clamp((p0_alpha.r - (16.0 / 255.0)) * (255.0 / 219.0), 0.0, 1.0);
+    let mask_full = clamp(p0_alpha.r, 0.0, 1.0);
+    let nv12_mask_a = select(mask_full, mask_limited, cs == 0u || cs == 1u);
+    let tb_alpha = select(nv12_mask_a, mask_full, kind == 3u);
+
+    let raw_alpha = select(select(1.0, p0_rgb.a, kind == 0u), tb_alpha, is_tb);
+    let a = raw_alpha * opacity;
+    return vec4<f32>(base_rgb * a, a);
 }

@@ -43,10 +43,10 @@ impl AhbDescriptor {
 /// `ptr_val` は `handle_to_jlong` が返した有効かつ未解放の `IkakimEngineHandle` ポインタか 0 である必要がある。
 #[inline]
 pub unsafe fn jlong_to_handle(ptr_val: i64) -> *mut IkakimEngineHandle {
-    if ptr_val <= 0 {
+    if ptr_val == 0 {
         std::ptr::null_mut()
     } else {
-        ptr_val as usize as *mut IkakimEngineHandle
+        ptr_val as u64 as usize as *mut IkakimEngineHandle
     }
 }
 
@@ -268,5 +268,84 @@ mod android_exports {
         handle: JLong,
     ) -> JInt {
         unsafe { ikakim_engine_request_keyframe(jlong_to_handle(handle)) }
+    }
+
+    /// NDK `jni.h` `struct JNINativeInterface`:
+    /// slot 230 = `void* (*GetDirectBufferAddress)(JNIEnv*, jobject)`
+    /// slot 231 = `jlong (*GetDirectBufferCapacity)(JNIEnv*, jobject)`
+    unsafe fn direct_buffer_slice<'a>(
+        env: JniEnvPtr,
+        buf: JObject,
+    ) -> Option<(*const u8, usize)> {
+        if env.is_null() || buf.is_null() {
+            return None;
+        }
+        let vtable = *(env as *const *const *const c_void);
+        if vtable.is_null() {
+            return None;
+        }
+        type GetAddrFn = unsafe extern "C" fn(JniEnvPtr, JObject) -> *mut c_void;
+        type GetCapFn = unsafe extern "C" fn(JniEnvPtr, JObject) -> i64;
+        let get_addr: GetAddrFn = std::mem::transmute(*vtable.add(230));
+        let get_cap: GetCapFn = std::mem::transmute(*vtable.add(231));
+        let ptr = get_addr(env, buf) as *const u8;
+        let cap = get_cap(env, buf);
+        if ptr.is_null() || cap <= 0 {
+            return None;
+        }
+        Some((ptr, cap as usize))
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_ikakim_live_IkakimBridge_nativeSubmitRgbaBuffer(
+        env: JniEnvPtr,
+        _cls: JObject,
+        handle: JLong,
+        layer_id: JInt,
+        is_base_layer: JBoolean,
+        top_bottom_alpha: JBoolean,
+        width: JInt,
+        height: JInt,
+        direct_buf: JObject,
+    ) -> JInt {
+        unsafe {
+            let Some((ptr, len)) = direct_buffer_slice(env, direct_buf) else {
+                return -1;
+            };
+            ikakim_engine_submit_rgba_layer(
+                jlong_to_handle(handle),
+                layer_id.max(0) as u32,
+                is_base_layer != 0,
+                top_bottom_alpha != 0,
+                width.max(0) as u32,
+                height.max(0) as u32,
+                ptr,
+                len,
+            )
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_ikakim_live_IkakimBridge_nativePushAudioF32Buffer(
+        env: JniEnvPtr,
+        _cls: JObject,
+        handle: JLong,
+        channel_index: JInt,
+        direct_buf: JObject,
+        sample_count: JInt,
+    ) -> JInt {
+        unsafe {
+            let Some((ptr, byte_len)) = direct_buffer_slice(env, direct_buf) else {
+                return -1;
+            };
+            let max_samples = byte_len / std::mem::size_of::<f32>();
+            let count = (sample_count.max(0) as usize).min(max_samples);
+            ikakim_engine_push_audio_f32(
+                jlong_to_handle(handle),
+                channel_index.max(0) as u32,
+                ptr as *const f32,
+                count,
+            )
+        }
     }
 }

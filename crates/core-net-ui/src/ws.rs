@@ -67,9 +67,16 @@ pub fn apply_ws_mask(payload: &mut [u8], key: [u8; 4]) {
 /// ストリームから 1 つの WebSocket フレームを読み取る（マスク解除含む）
 pub fn read_raw_frame<R: Read>(reader: &mut R) -> CoreResult<RawWsFrame> {
     let mut header = [0u8; 2];
-    reader
-        .read_exact(&mut header)
-        .map_err(|e| CoreError::Network(format!("ws read header: {}", e)))?;
+    reader.read_exact(&mut header).map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            CoreError::Network(format!("TimedOut: {}", e))
+        } else {
+            CoreError::Network(format!("ws read header: {}", e))
+        }
+    })?;
 
     let fin = (header[0] & 0x80) != 0;
     let opcode = WsOpcode::from_u8(header[0] & 0x0F)?;

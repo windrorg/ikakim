@@ -1,8 +1,10 @@
 /target
 /build
 /platforms/android/.gradle
+/platforms/android/build
 /platforms/android/app/build
 /platforms/android/app/src/main/jniLibs
+/platforms/ios/IkakimIosHost.xcodeproj
 **/*.rs.bk
 .DS_Store
 *.swp

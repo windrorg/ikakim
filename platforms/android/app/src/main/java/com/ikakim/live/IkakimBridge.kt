@@ -1,9 +1,7 @@
 package com.ikakim.live
 
-/**
- * JNI bridge matching `crates/ffi-capi/src/android_jni.rs` (`Java_com_ikakim_live_IkakimBridge_*`).
- * Expects `libffi_capi.so` built with `cargo ndk -t arm64-v8a build --release -p ffi-capi`.
- */
+import java.nio.ByteBuffer
+
 object IkakimBridge {
     init {
         System.loadLibrary("ffi_capi")
@@ -16,7 +14,7 @@ object IkakimBridge {
         previewHeight: Int,
         targetFps: Int,
         initialBitrateBps: Int,
-        httpPort: Int
+        httpPort: Int,
     ): Long
 
     external fun nativeDestroy(handle: Long)
@@ -31,7 +29,7 @@ object IkakimBridge {
         width: Int,
         height: Int,
         androidFormat: Int,
-        usageFlags: Long
+        usageFlags: Long,
     ): Int
 
     external fun nativeSubmitRgba(
@@ -42,21 +40,38 @@ object IkakimBridge {
         width: Int,
         height: Int,
         rgbaPtr: Long,
-        rgbaLen: Int
+        rgbaLen: Int,
     ): Int
 
     external fun nativePushAudioF32(
         handle: Long,
         channelIndex: Int,
         pcmPtr: Long,
-        sampleCount: Int
+        sampleCount: Int,
     ): Int
 
     external fun nativeStepTick(
         handle: Long,
         queuedRtmpBytes: Long,
-        elapsedMs: Long
+        elapsedMs: Long,
     ): Int
 
     external fun nativeRequestKeyframe(handle: Long): Int
+
+    external fun nativeSubmitRgbaBuffer(
+        handle: Long,
+        layerId: Int,
+        isBaseLayer: Boolean,
+        topBottomAlpha: Boolean,
+        width: Int,
+        height: Int,
+        directBuffer: ByteBuffer,
+    ): Int
+
+    external fun nativePushAudioF32Buffer(
+        handle: Long,
+        channelIndex: Int,
+        directBuffer: ByteBuffer,
+        sampleCount: Int,
+    ): Int
 }
