@@ -4,6 +4,12 @@ iOS / Android / Linux arm64 (Rockchip RK3588, Amlogic S905X2) / macOS に対応�
 
 詳細な設計仕様とモジュール構成は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)、各プラットフォーム（macOS / iOS / iPadOS / Android 実機・エミュレーター）での起動・E2E 検証・リモートアクセス手順は [docs/RUNNING_AND_VERIFICATION.md](docs/RUNNING_AND_VERIFICATION.md) を参照してください。
 
+## Streaming Dock の仕様と進捗
+
+モバイルアプリと、HDMI・音声入力・Linux音声処理を備えるDockの企画は、[Streaming Dockの仕様と進捗](docs/streaming-dock/README.md)にまとめています。構想仕様v0.6の要求、設計提案、未決定事項、実機検証待ちを分けて管理します。
+
+[実装状況と検証の記録](docs/streaming-dock/implementation-status.md)では、既存コードの到達点と過去の試験記録、Dockに向けた追加実装を整理しています。開発課題と依存関係は[全体管理Issue #9](https://github.com/windrorg/ikakim/issues/9)から追跡できます。
+
 ## ワークスペース構成
 
 ### コアクレート (`crates/`)
