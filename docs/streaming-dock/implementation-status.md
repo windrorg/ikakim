@@ -1,6 +1,6 @@
 # 実装状況と検証の記録
 
-[仕様と進捗の入口](README.md)
+[仕様と進捗の概要](README.md)
 
 最終参照日：2026年11月20日。仕様基準：[構想仕様 v0.6](requirements.md)。  
 コード基準：[コミット `37823d312d07ca8b3e39b34468b77ce80e1aa81c`](https://github.com/windrorg/ikakim/commit/37823d312d07ca8b3e39b34468b77ce80e1aa81c)（2026年11月14日）。
@@ -24,7 +24,7 @@
 
 | 既存 Issue | コードの到達点と根拠 | Dock に向けて追加すること |
 | --- | --- | --- |
-| [#1 開発環境・コア](https://github.com/windrorg/ikakim/issues/1) | 実装済み。[SPSC](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-types/src/ring_buffer.rs#L8)、[48 kHz クロック](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-types/src/clock.rs)、[状態機械](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-types/src/state.rs)・[トレイト](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-types/src/traits.rs)、[ワークスペース](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/Cargo.toml) | A7S の BSP と再現環境、外部時計との対応 |
+| [#1 開発環境・コア](https://github.com/windrorg/ikakim/issues/1) | 実装済み。[SPSC](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-types/src/ring_buffer.rs#L8)、[48 kHz クロック](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-types/src/clock.rs)、[状態機械](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-types/src/state.rs)・[トレイト](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-types/src/traits.rs)、[ワークスペース](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/Cargo.toml) | A7S の BSP と再現環境、外部クロックとの対応 |
 | [#2 音声ミキサー](https://github.com/windrorg/ikakim/issues/2) | 実装済み。[ステレオ mix / gain / mute / delay](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-audio/src/mixer.rs#L412)、[ALSA capture](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/linux-common/src/alsa.rs#L143)、[Apple AAC](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/apple-common/src/audio_toolbox.rs#L213) | 4 論理バス、独立モニター、指定 FX、クロック調整 |
 | [#3 RTMPS・ABR](https://github.com/windrorg/ikakim/issues/3) | 実装済み。[TLS](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-rtmp/src/transport.rs)、[再接続](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-rtmp/src/publisher.rs)、[ABR](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-rtmp/src/abr.rs) | Dock・ゲスト通話・配信の同時負荷、端末回線変更 |
 | [#4 制御 UI・プレビュー](https://github.com/windrorg/ikakim/issues/4) | 実装済み。[HTTP / WS](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-net-ui/src/server.rs)、[JSON-RPC](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-net-ui/src/rpc.rs#L250)、[MSE](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/web-ui/app.js#L390) | Dock 制御と状態同期、実測遅延、端末別の表示 |
@@ -54,9 +54,9 @@ Apple / SRS の試験には [1080p60 の試験コード](https://github.com/wind
 
 ### 音声：ステレオ mix と Dock の 4 バスは別
 
-既存 [AudioMixer](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-audio/src/mixer.rs#L412) は複数入力をステレオ master にまとめる基盤。Program と Local/Media の送出、BGM/SE と Guest の独立 return、直接モニター、物理 Mic2 + Stereo LINE の独立取得を完成させたものではない。
+既存 [AudioMixer](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-audio/src/mixer.rs#L412) は複数入力をステレオ master へミックスする基盤。Program と Local/Media の送出、BGM/SE と Guest の独立 return、直接モニター、物理マイク2本＋ステレオLINE の独立取得を完成させたものではない。
 
-[既存 resampler](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-audio/src/resampler.rs#L29) は設定レート間の変換であり、独立した HDMI・ADC・USB・WebRTC の時計偏差に追従する制御ループは追加対象。既存 soft clip も、製品が求める limiter の仕様適合とは分けて評価する。新しいバス構造と FX の範囲は [音声設計](audio.md) に定める。
+[既存 resampler](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/core-audio/src/resampler.rs#L29) は設定レート間の変換であり、独立した HDMI・ADC・USB・WebRTC のクロック偏差に追従する制御ループは追加対象。既存 soft clip も、製品が求める limiter の仕様適合とは分けて評価する。新しいバス構造と FX の範囲は [音声設計](audio.md) に定める。
 
 ### Linux：ゼロコピーの範囲と A7S 対応を限定して記す
 
@@ -66,17 +66,17 @@ Apple / SRS の試験には [1080p60 の試験コード](https://github.com/wind
 
 A7S / A733 の CSI・符号化・USB Gadget は、新しい [試作計画](prototype.md) と [検証条件](validation.md) で成立を確認する。
 
-### iOS：入力の入口はあるが、Dock 受信と同期は追加対象
+### iOS：入力インターフェースはあるが、Dock 受信と同期は追加対象
 
-[iOS の AVFoundation 入力](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/ios/AVCaptureCameraBridge.swift#L49) は内蔵カメラと既定音声入力を構成する。[外部 CVPixelBuffer の注入口](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/ios/AVCaptureCameraBridge.swift#L43) はあるが、USB / IP デバイスの探索、受信、復号、切断復帰を実装したことにはならない。
+[iOS の AVFoundation 入力](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/ios/AVCaptureCameraBridge.swift#L49) は内蔵カメラと既定音声入力を構成する。[外部 CVPixelBuffer の入力インターフェース](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/ios/AVCaptureCameraBridge.swift#L43) はあるが、USB / IP デバイスの探索、受信、復号、切断復帰を実装したことにはならない。
 
-[映像 callback](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/ios/IkakimWebViewApp.swift#L245) では CMTime を引き継いでいない。Dock や WebRTC の元 PTS と共通時計の対応、追加された Dock 音声往復の補償は [アプリ統合](app-integration.md) の課題とする。
+[映像 callback](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/ios/IkakimWebViewApp.swift#L245) では CMTime を引き継いでいない。Dock や WebRTC の元 PTS と共通クロックの対応、追加された Dock 音声往復の補償は [アプリ統合](app-integration.md) の課題とする。
 
 ### Android：実カメラと実音声の配信経路は未完成
 
 | 項目 | 基準コミットの状態 | 必要な接続 |
 | --- | --- | --- |
-| 実カメラ | [Activity](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/android/app/src/main/java/com/ikakim/live/IkakimHostActivity.kt#L88) は仮想 RGBA / PCM の投入を持つが、実 Camera2 capture を開始しない。[Camera2 wrapper](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/android/app/src/main/java/com/ikakim/live/Camera2AhbCapture.kt) は別に存在 | 起動、権限、実フレームの取得、停止・再開を engine へ接続 |
+| 実カメラ | [Activity](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/android/app/src/main/java/com/ikakim/live/IkakimHostActivity.kt#L88) は仮想 RGBA / PCM の入力処理があるが、実 Camera2 capture を開始しない。[Camera2 wrapper](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/android/app/src/main/java/com/ikakim/live/Camera2AhbCapture.kt) は別に存在 | 起動、権限、実フレームの取得、停止・再開を engine へ接続 |
 | AHardwareBuffer | [FFI](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/ffi-capi/src/lib.rs#L761) は descriptor の登録。[importer](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/android-native/src/ahb_vulkan.rs#L339) は native texture 未指定時に placeholder を作る | バッファの寿命・同期を含む実画素の GPU import |
 | MediaCodec / AAudio | [MediaCodec](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/android-native/src/mediacodec.rs#L194) は NDK symbol probe と抽象化、[AAudio](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/android-native/src/aaudio.rs#L32) は trait / mock / wrapper。[M4 試験](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/android-native/tests/android_m4_bridge_test.rs) も mock を使用 | 実 backend を実装し、Android の稼働経路へ接続 |
 | 配信用音声 | [共通 FFI](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/ffi-capi/src/lib.rs#L126) は非 Apple で fallback audio を選ぶ。[その出力](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/crates/ffi-capi/src/lib.rs#L108) は固定の無音 AAC placeholder | 入力 PCM を実際に AAC へ符号化し、音が配信されることを確認 |
@@ -91,7 +91,8 @@ A7S / A733 の CSI・符号化・USB Gadget は、新しい [試作計画](proto
 - 基板版、OS / kernel / BSP、端末と OS、音声・映像形式、USB 接続条件。
 - 使用した信号源と codec、実行した試験、スキップと制約。
 - fps / 欠落、遅延、A/V ずれ、xrun / FIFO、温度・電力など、その課題に必要な測定ログ。
-- 達成した要求と残る制限。仕様変更があれば [正本文書](README.md) も更新する。
+- 達成した要求と残る制限。仕様変更があれば [仕様書](README.md) も更新する。
 
 初回 VRC-01 の stereo / 2 マイク分離実証、物理 4 入力の回路実証、端末との論理 4 in / 4 out は別の結果として記録する。ゲスト 1 名は初期 PoC、720p30 は仮の評価条件であり、製品最大人数と保証画質を決めたものではない。
+
 

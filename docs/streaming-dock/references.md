@@ -1,6 +1,6 @@
 # 技術資料と改訂記録
 
-[仕様と進捗の入口](README.md)
+[仕様と進捗の概要](README.md)
 
 基準：構想仕様 v0.6、2026年11月20日。C＝確定要求、P＝設計提案、O＝未決定、V＝実機検証待ち。確定要求は実装済みを意味しません。
 
@@ -146,7 +146,7 @@ S33  [Linux Kernel UAC2 Gadget設定と同期方式](https://docs.kernel.org/usb
 
 <a id="s34"></a>
 
-S34  [RFC 3550 RTPとRTCPの時計対応](https://www.rfc-editor.org/rfc/rfc3550.html)
+S34  [RFC 3550 RTPとRTCPのクロック対応](https://www.rfc-editor.org/rfc/rfc3550.html)
 
 ### ikakimの参照ソース
 
@@ -156,7 +156,7 @@ R01  [READMEとモジュール構成](https://github.com/windrorg/ikakim/blob/37
 
 <a id="r02"></a>
 
-R02  [iOSカメラ入力と外部バッファの入口](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/ios/AVCaptureCameraBridge.swift)
+R02  [iOSカメラ入力と外部バッファの入力インターフェース](https://github.com/windrorg/ikakim/blob/37823d312d07ca8b3e39b34468b77ce80e1aa81c/platforms/ios/AVCaptureCameraBridge.swift)
 
 <a id="r03"></a>
 
@@ -301,7 +301,7 @@ S60  [Radxa Cubie A7S V1.10 回路図 10 CAMERA・12 TYPE C](https://dl.radxa.co
 
 <a id="s61"></a>
 
-S61  [Roland VRC-01 AUDIOブロック図 p.2 USB L/Rと戻り経路](https://static.roland.com/products/vrc-01/images/blockdiagram.pdf)
+S61  [Roland VRC-01 AUDIOブロック図 p.2 USB L/Rとリターン経路](https://static.roland.com/products/vrc-01/images/blockdiagram.pdf)
 
 <a id="s62"></a>
 
@@ -324,3 +324,4 @@ S65  [Roland VRC-01 MIC 1＝L／MIC 2＝Rのstereo link](https://support.roland.
 4音声バス、Linuxサービス、FX縮小順、Cloudflare構成、ゲスト720p30、VRC-01の暫定利用、価格試算は設計提案。メーカーの完成済み製品仕様や、実機で達成した測定値とは区別する。
 
 S43／S45の専用DSP資料は前版との比較履歴として残した。現行の初期音声構成はLinux上のmix／FXであり、専用音声DSPを含めていない。
+

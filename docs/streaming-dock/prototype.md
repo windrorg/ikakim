@@ -1,12 +1,12 @@
 # Cubie A7S・VRC-01の初期試作
 
-[仕様と進捗の入口](README.md)
+[仕様と進捗の概要](README.md)
 
 基準：構想仕様 v0.6、2026年11月20日。C＝確定要求、P＝設計提案、O＝未決定、V＝実機検証待ち。確定要求は実装済みを意味しません。
 
 ## 16  Cubie A7SとVRC-01のバラック接続案
 
-C  初回試作はCubie A7S、手持ちのVRC-01あり。P / V  VRC-01を暫定音声IFとしてLinuxのmix／FXを立ち上げる。公式ブロック図のUSB出力は混合済みL/Rであり、製品の独立4入力を満たす機器とは扱わない。[S61](references.md#s61)
+C  初回試作にはCubie A7Sを使用する。VRC-01は所有機材である。P / V  VRC-01を暫定音声IFとしてLinuxのmix／FXの動作検証を開始する。公式ブロック図のUSB出力は混合済みL/Rであり、製品の独立4入力を満たす機器とは扱わない。[S61](references.md#s61)
 
 ![構成図](assets/prototype-a7s-vrc01.png)
 
@@ -19,7 +19,7 @@ C  初回試作はCubie A7S、手持ちのVRC-01あり。P / V  VRC-01を暫定�
 | VRC-01の電源 | DC IN 5Vへ別の5V／1A以上電源。USBバス給電ではMIC 2の48Vを使えないため、マイク2本のファンタム試験は外部給電する。[S62](references.md#s62) |
 | 映像と端末接続 | C790＋4lane配線変換、HDMI信号源、データ対応USB-Cケーブル。PCでGadgetを確認後、USB-C端末へ進む。 |
 
-VRC-01はstereo／2マイク分離試験用。最終製品の物理4ADC／2DAC、端末との論理UAC 4in／4outは別仕様として維持する。VRC-01内蔵monitorを切り、Linuxを通った音だけを聴く。設定と確認手順は[第18章](prototype.md)。
+VRC-01はstereo／2マイク分離試験用。最終製品の物理4ADC／2DAC、端末との論理UAC 4in／4outは別仕様として維持する。VRC-01内蔵monitorを無効にし、Linuxを経由した音声だけをモニターする。設定と確認手順は[第18章](prototype.md)。
 
 ## 17  バラック試作で先に確認する接続条件
 
@@ -39,7 +39,7 @@ A7Sは31pin・0.3mm・4lane、C790の4lane側は22pin・0.5mm。コネクタ形�
 | CSI Data N／P | D0＝14／15、D1＝11／12、D2＝5／6、D3＝2／3番。 |
 | 対象と根拠 | V1.10回路図の10 CAMERA、J5。実物基板版とC790側のpin番号・接点面を照合してから配線図を確定する。[S60](references.md#s60) |
 
-Raspberry Pi向け設定をそのまま適用せず、TC358743ドライバー、A733 CSI受信系、Device Tree、YUV形式、4laneリンクと1080p60のタイミングを確認する。C790のHDMI音声は別のI2S経路で取り込む。映像のみの成功を音声取得の成功に数えない。[S13–S16](references.md#s13)
+Raspberry Pi向け設定をそのまま適用せず、TC358743ドライバー、A733 CSI受信系、Device Tree、YUV形式、4laneリンクと1080p60のタイミングを確認する。C790のHDMI音声は別のI2S経路で取り込む。映像のみの動作確認を音声取得の成功とは扱わない。[S13–S16](references.md#s13)
 
 ### 最初の起動で採取する記録
 
@@ -61,9 +61,9 @@ HDMIを接続する前にテスト映像のH.264符号化を確認し、続い�
 
 | 設定 | 試験時の状態 |
 | --- | --- |
-| LOOPBACK／monitor | LOOPBACKを左いっぱいでOFF、DIRECT MONITORをOFF。USB再生が再びcaptureへ入らず、Linuxの戻りだけを聴く状態にする。[S61,S63](references.md#s61) |
+| LOOPBACK／monitor | LOOPBACKを左端まで回してOFF、DIRECT MONITORをOFF。USB再生が再びcaptureへ入らず、Linuxからの再生音だけをモニターする状態にする。[S61,S63](references.md#s61) |
 | 内蔵処理 | COMP／LIMITER、REVERB、LIP SYNC DELAYを最小。ECHO CANCEL、AUTO LEVELER、LOW CUT、DE-ESSERをOFF。USER消灯で標準割当を確認。[S63](references.md#s63) |
-| 毎起動のゲート | ノイズゲートは起動時ONへ戻る。USERを押しながらASSIGNABLE DECK［1］を押し、緑＝OFFを確認。赤＝ON。[S64](references.md#s64) |
+| 起動時のゲート設定 | ノイズゲートは起動時ONへ戻る。USERを押しながらASSIGNABLE DECK［1］を押し、緑＝OFFを確認。赤＝ON。[S64](references.md#s64) |
 | 入力と音量 | 未使用入力を下げ、MAINと入力faderの値を記録。聴取音量はPHONESで低い状態から調整。Mic 1／2分離時はLINEと内蔵micを止める。 |
 
 ### 最初に確認する3つの信号経路
@@ -74,4 +74,5 @@ HDMIを接続する前にテスト映像のH.264符号化を確認し、続い�
 
 arecord -l／aplay -lと /proc/asound/card*/stream* で実レート・形式・ch数を確認し、同時録再を実行。FX、端末4バス、HDMI負荷を順に加えてxrunと遅延を測る。追加入力をファイルで模擬しても、4ADCの成立証明にはならない。
 
-内蔵処理を切っても未加工ADC出力とは見なさない。VRC-01を含む遅延と音質はこの暫定系の測定値。量産音声回路へ置換後に再評価する。VRC-01の操作ボタンやMIDIの再利用も未確認。
+内蔵処理を無効にしても未加工のADC出力とは見なさない。VRC-01を含む遅延と音質はこの暫定構成の測定値である。量産音声回路への置換後に再評価する。VRC-01の操作ボタンやMIDIの再利用も未確認。
+
